@@ -1,0 +1,395 @@
+SPC7110_AluWaitResult:
+    sep #$20 : .as
+    
+    lda $482F
+    and #$80
+    bne SPC7110_AluWaitResult
+    rts
+
+SPC7110_AluReset:
+    sep #$20 : .as
+    
+    lda #$00
+    sta $482E
+    rts
+    
+SPC7110_AluMulTest:
+    sep #$20 : .as
+    
+    lda W_SPC7110_MulA
+    sta $4820
+    lda W_SPC7110_MulA + 1
+    sta $4821
+    
+    lda W_SPC7110_MulB
+    sta $4824
+    lda W_SPC7110_MulB + 1
+    sta $4825 ;This triggers a multiply.
+    
+    jsr SPC7110_AluWaitResult
+    
+    lda $4828
+    sta W_SPC7110_MulResult
+    lda $4829
+    sta W_SPC7110_MulResult + 1
+    lda $482A
+    sta W_SPC7110_MulResult + 2
+    lda $482B
+    sta W_SPC7110_MulResult + 3
+    
+    rts
+    
+SPC7110_AluDivTest:
+    sep #$20 : .as
+    
+    stz $482E
+    
+    lda W_SPC7110_Dividend
+    sta $4820
+    lda W_SPC7110_Dividend + 1
+    sta $4821
+    lda W_SPC7110_Dividend + 2
+    sta $4822
+    lda W_SPC7110_Dividend + 3
+    sta $4823
+    
+    lda W_SPC7110_Divisor
+    sta $4826
+    lda W_SPC7110_Divisor + 1
+    sta $4827 ;This triggers a divide.
+    
+    jsr SPC7110_AluWaitResult
+    
+    lda $4828
+    sta W_SPC7110_Quotient
+    lda $4829
+    sta W_SPC7110_Quotient + 1
+    lda $482A
+    sta W_SPC7110_Quotient + 2
+    lda $482B
+    sta W_SPC7110_Quotient + 3
+    
+    lda $482C
+    sta W_SPC7110_Remainder
+    lda $482D
+    sta W_SPC7110_Remainder + 1
+    
+    rts
+    
+SPC7110_DirectDataTest4810:
+    sep #$20 : .as
+    
+    lda #$01
+    sta $4813
+    
+    lda #$00
+    sta $4813
+    
+    lda #$13 ;Increase-by-Step, Use Offset, Apply Step To Offset
+    sta $4818
+    
+    rep #$20 : .al
+    
+    lda #$0000
+    sta $4811
+    lda #$0001
+    sta $4814
+    lda #$0002
+    sta $4816
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString1
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString1
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+
+    sep #$20 : .as
+    lda $4813
+    jsr PPUConsole_PrintIntHex8
+    lda $4812
+    jsr PPUConsole_PrintIntHex8
+    lda $4811
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString2
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString2
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda $4815
+    jsr PPUConsole_PrintIntHex8
+    lda $4814
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString3
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString3
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda $4817
+    jsr PPUConsole_PrintIntHex8
+    lda $4816
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString4
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString4
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda #$13
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString5
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString5
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    ldy #$8
+directReadLoop
+    phy
+    lda $4810
+    jsr PPUConsole_PrintIntHex8
+    ply
+    dey
+    bne directReadLoop
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString7
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString7
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+
+    sep #$20 : .as
+    lda $4813
+    jsr PPUConsole_PrintIntHex8
+    lda $4812
+    jsr PPUConsole_PrintIntHex8
+    lda $4811
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString2
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString2
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda $4815
+    jsr PPUConsole_PrintIntHex8
+    lda $4814
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString3
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString3
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda $4817
+    jsr PPUConsole_PrintIntHex8
+    lda $4816
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString4
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString4
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda #$13
+    jsr PPUConsole_PrintIntHex8
+    
+    rts
+    
+SPC7110_DirectDataTest481A:
+    sep #$20 : .as
+    
+    lda #$01
+    sta $4813
+    
+    lda #$00
+    sta $4813
+    
+    lda #$13 ;Increase-by-Step, Use Offset, Apply Step To Offset
+    sta $4818
+    
+    rep #$20 : .al
+    
+    lda #$0000
+    sta $4811
+    lda #$0001
+    sta $4814
+    lda #$0002
+    sta $4816
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString1
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString1
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+
+    sep #$20 : .as
+    lda $4813
+    jsr PPUConsole_PrintIntHex8
+    lda $4812
+    jsr PPUConsole_PrintIntHex8
+    lda $4811
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString2
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString2
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda $4815
+    jsr PPUConsole_PrintIntHex8
+    lda $4814
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString3
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString3
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda $4817
+    jsr PPUConsole_PrintIntHex8
+    lda $4816
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString4
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString4
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda #$13
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString6
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString6
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    ldy #$8
+directReadLoop2
+    phy
+    lda $4810
+    jsr PPUConsole_PrintIntHex8
+    ply
+    dey
+    bne directReadLoop2
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString7
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString7
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+
+    sep #$20 : .as
+    lda $4813
+    jsr PPUConsole_PrintIntHex8
+    lda $4812
+    jsr PPUConsole_PrintIntHex8
+    lda $4811
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString2
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString2
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda $4815
+    jsr PPUConsole_PrintIntHex8
+    lda $4814
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString3
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString3
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda $4817
+    jsr PPUConsole_PrintIntHex8
+    lda $4816
+    jsr PPUConsole_PrintIntHex8
+    
+    rep #$20 : .al
+    lda #SPC7110_DirectDataTestString4
+    sta W_PPUConsole_StringPtr
+    
+    sep #$20 : .as
+    lda #^SPC7110_DirectDataTestString4
+    sta W_PPUConsole_StringPtrBank
+    jsr PPUConsole_PrintStr
+    
+    lda #$13
+    jsr PPUConsole_PrintIntHex8
+    
+    rts
+    
+SPC7110_DirectDataTestString1: .byt $0A, "   - DIRECT ROM ACCESS INIT -", $0A, "$", $00
+SPC7110_DirectDataTestString2: .byt "+$", $00
+SPC7110_DirectDataTestString3: .byt ", STEP $", $00
+SPC7110_DirectDataTestString4: .byt " MODE", $00
+SPC7110_DirectDataTestString5: .byt $0A, "4810 RD$", $00
+SPC7110_DirectDataTestString6: .byt $0A, "481A RD$", $00
+SPC7110_DirectDataTestString7: .byt $0A, "  - DIRECT ROM ACCESS RESULT -", $0A, "$", $00
