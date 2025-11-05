@@ -18,6 +18,8 @@
 // Additional Comments:
 //
 //////////////////////////////////////////////////////////////////////////////////
+`include "config.vh"
+
 module msu(
   input clkin,
   input enable,
@@ -47,6 +49,8 @@ module msu(
   output [13:0] DBG_msu_address,
   output DBG_msu_address_ext_write_rising
 );
+
+reg msu_addr_inc_arm = 0;
 
 reg [1:0] status_reset_we_r;
 always @(posedge clkin) status_reset_we_r = {status_reset_we_r[0], status_reset_we};
@@ -111,6 +115,8 @@ assign status_out = {msu_address_r[13], // 7
 
 initial msu_address_r = 14'h1234;
 
+`ifdef MK2
+`ifndef DEBUG
 msu_databuf snes_msu_databuf (
   .clka(clkin),
   .wea(~pgm_we), // Bus [0 : 0]
@@ -120,22 +126,41 @@ msu_databuf snes_msu_databuf (
   .addrb(msu_address), // Bus [13 : 0]
   .doutb(msu_data)
 ); // Bus [7 : 0]
-
+`endif
+`endif
+`ifdef MK3
+msu_databuf snes_msu_databuf (
+  .clock(clkin),
+  .wren(~pgm_we), // Bus [0 : 0]
+  .wraddress(pgm_address), // Bus [13 : 0]
+  .data(pgm_data), // Bus [7 : 0]
+  .rdaddress(msu_address), // Bus [13 : 0]
+  .q(msu_data)
+); // Bus [7 : 0]
+`endif
 reg [7:0] data_out_r;
 assign reg_data_out = data_out_r;
 
 always @(posedge clkin) begin
-  if(msu_address_ext_write_rising)
+  if(msu_address_ext_write_rising) begin
     msu_address_r <= msu_address_ext;
-  else if(reg_oe_rising & enable & (reg_addr == 3'h1)) begin
+  end else if(reg_oe_rising & msu_addr_inc_arm) begin
     msu_address_r <= msu_address_r + 1;
+  end
+end
+
+always @(posedge clkin) begin
+  if(reg_oe_falling & enable & (reg_addr == 3'h1)) begin
+    msu_addr_inc_arm <= 1'b1;
+  end else if(reg_oe_rising) begin
+    msu_addr_inc_arm <= 1'b0;
   end
 end
 
 always @(posedge clkin) begin
   if(reg_oe_falling & enable)
     case(reg_addr)
-      3'h0: data_out_r <= {data_busy_r, audio_busy_r, audio_status_r, audio_error_r, 3'b001};
+      3'h0: data_out_r <= {data_busy_r, audio_busy_r, audio_status_r, audio_error_r, 3'b010};
       3'h1: data_out_r <= msu_data;
       3'h2: data_out_r <= 8'h53;
       3'h3: data_out_r <= 8'h2d;
