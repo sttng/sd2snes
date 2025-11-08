@@ -72,6 +72,13 @@ module mcu_cmd(
   output [13:0] msu_ptr_out,
   output msu_reset_out,
 
+  // generic RTC
+  output [55:0] rtc_data_out,
+  output rtc_pgm_we,
+  
+  // S-RTC
+  output srtc_reset,
+
   // feature enable
   output reg [15:0] featurebits_out,
 
@@ -110,6 +117,12 @@ reg [5:0] msu_status_set_out_buf;
 reg [5:0] msu_status_reset_out_buf;
 reg msu_status_reset_we_buf = 0;
 reg MSU_RESET_OUT_BUF;
+
+reg [55:0] rtc_data_out_buf;
+reg rtc_pgm_we_buf;
+
+reg srtc_reset_buf;
+initial srtc_reset_buf = 0;
 
 reg [7:0] MCU_DATA_OUT_BUF;
 reg [7:0] MCU_DATA_IN_BUF;
@@ -287,6 +300,36 @@ always @(posedge clk) begin
             MSU_RESET_OUT_BUF <= 1'b1;
           end
         endcase
+      8'he5:
+        case (spi_byte_cnt)
+          32'h2:
+            rtc_data_out_buf[55:48] <= param_data;
+          32'h3:
+            rtc_data_out_buf[47:40] <= param_data;
+          32'h4:
+            rtc_data_out_buf[39:32] <= param_data;
+          32'h5:
+            rtc_data_out_buf[31:24] <= param_data;
+          32'h6:
+            rtc_data_out_buf[23:16] <= param_data;
+          32'h7:
+            rtc_data_out_buf[15:8] <= param_data;
+          32'h8: begin
+            rtc_data_out_buf[7:0] <= param_data;
+            rtc_pgm_we_buf <= 1'b1;
+          end
+          32'h9:
+            rtc_pgm_we_buf <= 1'b0;
+        endcase
+      8'he7:
+        case (spi_byte_cnt)
+          32'h2: begin
+            srtc_reset_buf <= 1'b1;
+          end
+          32'h3: begin
+            srtc_reset_buf <= 1'b0;
+          end
+        endcase
       8'hec:
         begin // set DAC properties
           dac_vol_select_out <= param_data[2:0];
@@ -437,6 +480,11 @@ assign msu_status_reset_out = msu_status_reset_out_buf;
 assign msu_status_set_out = msu_status_set_out_buf;
 assign msu_reset_out = MSU_RESET_OUT_BUF;
 assign msu_ptr_out = MSU_PTR_OUT_BUF;
+
+assign rtc_data_out = rtc_data_out_buf;
+assign rtc_pgm_we = rtc_pgm_we_buf;
+
+assign srtc_reset = srtc_reset_buf;
 
 assign mcu_data_out = SD_DMA_STATUS ? SD_DMA_SRAM_DATA : MCU_DATA_OUT_BUF;
 assign mcu_mapper = MAPPER_BUF;

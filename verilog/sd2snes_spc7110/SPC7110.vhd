@@ -53,14 +53,7 @@ entity SPC7110 is
 			SNES_WR								: in	STD_LOGIC;
 			SNES_WR_End							: in	STD_LOGIC;
 			DMA_Transferring					: out STD_LOGIC;
-			Idle									: out STD_LOGIC;
-		RTC_DO			: out std_logic_vector(3 downto 0);
-		RTC_DI			: in std_logic_vector(3 downto 0);
-		RTC_CE			: out std_logic;
-		RTC_CK			: out std_logic
-			
-			
-			
+			Idle									: out STD_LOGIC
 			);
 end SPC7110;
 

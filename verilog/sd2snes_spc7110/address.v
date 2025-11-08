@@ -30,6 +30,7 @@ module address(
   input [23:0] SAVERAM_MASK,
   input [23:0] ROM_MASK,
   output msu_enable,
+  output srtc_enable,
   output r213f_enable,
   output r2100_hit,
   output snescmd_enable,
@@ -42,6 +43,7 @@ module address(
 
 /* feature bits. see src/fpga_spi.c for mapping */
 parameter [2:0]
+  FEAT_SRTC = 2,
   FEAT_MSU1 = 3,
   FEAT_213F = 4
 ;
@@ -103,6 +105,7 @@ assign ROM_HIT = IS_ROM | IS_WRITABLE;
 
 // '1' when accessing to MSU register map $2000:$2007
 assign msu_enable = featurebits[FEAT_MSU1] & (!SNES_ADDR[22] && ((SNES_ADDR[15:0] & 16'hfff8) == 16'h2000));
+assign srtc_enable = featurebits[FEAT_SRTC] & (!SNES_ADDR[22] && ((SNES_ADDR[15:0] & 16'hfffe) == 16'h2800));
 
 assign r213f_enable = featurebits[FEAT_213F] & (SNES_PA == 8'h3f);
 assign r2100_hit = (SNES_PA == 8'h00);

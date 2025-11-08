@@ -124,6 +124,12 @@ wire [7:0] MSU_SNES_DATA_OUT;
 wire [5:0] msu_status_reset_bits;
 wire [5:0] msu_status_set_bits;
 
+wire [59:0] rtc_data;
+wire [55:0] rtc_data_in;
+wire [59:0] srtc_rtc_data_out;
+wire [3:0] SRTC_SNES_DATA_IN;
+wire [7:0] SRTC_SNES_DATA_OUT;
+
 wire [15:0] featurebits;
 wire feat_cmd_unlock = featurebits[5];
 
@@ -248,6 +254,8 @@ parameter ROM_CYCLE_LEN = 4'd7;
 reg [4:0] STATE;
 initial STATE = ST_IDLE;
 
+
+assign SRTC_SNES_DATA_IN = BUS_DATA[3:0];
 assign MSU_SNES_DATA_IN = BUS_DATA;
 
 sd_dma snes_sd_dma(
@@ -287,6 +295,34 @@ dac snes_dac(
   .play(dac_play),
   .reset(dac_reset),
   .dac_address_ext(dac_ptr_addr)
+);
+
+srtc snes_srtc (
+  .clkin(CLK2),
+  .addr_in(SNES_ADDR[0]),
+  .data_in(SRTC_SNES_DATA_IN),
+  .data_out(SRTC_SNES_DATA_OUT),
+  .rtc_data_in(rtc_data),
+  .enable(srtc_enable),
+  .rtc_data_out(srtc_rtc_data_out),
+  .reg_oe_falling(SNES_RD_start),
+  .reg_oe_rising(SNES_RD_end),
+  .reg_we_rising(SNES_WR_end),
+  .rtc_we(srtc_rtc_we),
+  .reset(srtc_reset),
+  .srtc_state(DBG_srtc_state),
+  .srtc_reg_we_rising(DBG_srtc_we_rising),
+  .srtc_rtc_ptr(DBG_srtc_ptr),
+  .srtc_we_sreg(DBG_srtc_we_sreg)
+);
+
+rtc snes_rtc (
+  .clkin(CLKIN),
+  .rtc_data(rtc_data),
+  .rtc_data_in(rtc_data_in),
+  .pgm_we(rtc_pgm_we),
+  .rtc_data_in1(srtc_rtc_data_out),
+  .we1(srtc_rtc_we)
 );
 
 msu snes_msu (
@@ -471,6 +507,9 @@ mcu_cmd snes_mcu_cmd(
   .msu_trackrq(msu_trackrq_out),
   .msu_ptr_out(msu_ptr_addr),
   .msu_reset_out(msu_addr_reset),
+  .rtc_data_out(rtc_data_in),
+  .rtc_pgm_we(rtc_pgm_we),
+  .srtc_reset(srtc_reset),
   .featurebits_out(featurebits),
   .mcu_rrq(MCU_RRQ),
   .mcu_wrq(MCU_WRQ),
@@ -505,6 +544,8 @@ address snes_addr(
   .ROM_MASK(ROM_MASK),
   //MSU-1
   .msu_enable(msu_enable),
+   //SRTC
+  .srtc_enable(srtc_enable),
   .r213f_enable(r213f_enable),
   .r2100_hit(r2100_hit),
   .snescmd_enable(snescmd_enable),
@@ -599,7 +640,8 @@ end
 assign SNES_DATA = (r213f_enable & ~SNES_PARD & ~r213f_forceread) ? r213fr
                    :(r2100_enable & ~SNES_PAWR & r2100_forcewrite) ? r2100r
                    :(~SNES_READ ^ (r213f_forceread & r213f_enable & ~SNES_PARD)) ?
-              ( msu_enable ? MSU_SNES_DATA_OUT
+              (srtc_enable ? SRTC_SNES_DATA_OUT
+                                  :msu_enable ? MSU_SNES_DATA_OUT
               :(cheat_hit & ~feat_cmd_unlock) ? cheat_data_out
               :((snescmd_unlock | feat_cmd_unlock) & snescmd_enable) ? snescmd_dout
               // RG S-DD1 will drive data on normal ROM and RAM reads, during a decompression DMA, and when a $480X register is read.
@@ -885,9 +927,12 @@ assign ROM_BHE = (spc7110_enable & ~SDD1_ROM_CE & ~MCU_HIT)?1'b0:ROM_ADDR0;
 // '0' when accessing low byte
 assign ROM_BLE = (spc7110_enable & ~SDD1_ROM_CE & ~MCU_HIT)?1'b0:!ROM_ADDR0;
 
+reg ReadOrWrite_r; always @(posedge CLK2) ReadOrWrite_r <= ~(SNES_READr[1] & SNES_READr[0] & SNES_WRITEr[1] & SNES_WRITEr[0]);
+
 // active low signal to enable level converters' output; it enables output in both sides of the chip
 assign SNES_DATABUS_OE = msu_enable & ~(SNES_READ_narrow & SNES_WRITE) ? 1'b0 :
                          snescmd_enable & ~(SNES_READ_narrow & SNES_WRITE) ? ~(snescmd_unlock | feat_cmd_unlock) :
+								 (srtc_enable & ReadOrWrite_r) ? 1'b0 :
                          (sdd1_reg_enable | (sdd1_snoop_enable & ~SNES_WRITE)) ? 1'b0 :
                          (r213f_enable & ~SNES_PARD) ? 1'b0 :
                          (r2100_enable & ~SNES_PAWR) ? 1'b0 :

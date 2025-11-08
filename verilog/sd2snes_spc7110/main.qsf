@@ -503,6 +503,8 @@ set_global_assignment -name OUTPUT_IO_TIMING_FAR_END_VMEAS "HALF SIGNAL SWING" -
 set_global_assignment -name OUTPUT_IO_TIMING_FAR_END_VMEAS "HALF SIGNAL SWING" -fall
 set_global_assignment -name VERILOG_MACRO "MK3=<None>"
 
+set_global_assignment -name VERILOG_FILE rtc.v
+set_global_assignment -name VERILOG_FILE srtc.v
 set_global_assignment -name VHDL_FILE SPC7110_MULDIV.vhd
 set_global_assignment -name VHDL_FILE SPC7110_DEC_PKG.vhd
 set_global_assignment -name VHDL_FILE SPC7110_DEC.vhd
