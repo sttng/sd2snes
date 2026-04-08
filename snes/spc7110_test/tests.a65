@@ -203,7 +203,7 @@ GAME_MAIN:
    jsr SPC7110_DirectDataTest481A
 -	bra -
 
-Test_ConsoleString1: .byt "SD2SNES SPC7110 CHECK PROGRAM", $0A, "MUL:    $FFFF*$FFFF = $", $00
+Test_ConsoleString1: .byt "                                SPC7110 TEST PROGRAM", $0A, "                                MUL:    $FFFF*$FFFF = $", $00
 Test_ConsoleString2: .byt $0A, "MUL:    $F0BF*$1234 = $", $00
 Test_ConsoleString3: .byt $0A, "MUL:    $0000*$0000 = $", $00
 Test_ConsoleString4: .byt $0A, "DIV:$FEFFCFFF/$0010 = $", $00
