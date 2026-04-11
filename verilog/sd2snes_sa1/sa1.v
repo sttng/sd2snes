@@ -403,12 +403,25 @@ wire      sa1_clock_en_pre = sa1_cycle_r == 6;
 
 always @(posedge CLK) begin
   if (RST) begin
-    sa1_cycle_r <= 0;
+    sa1_cycle_r  <= 0;
     sa1_clock_en <= 0;
   end
   else begin
-    sa1_cycle_r  <= sa1_cycle_r + 1;
-    sa1_clock_en <= sa1_clock_en_pre;
+    // Reset the 8-CLK2 window on each pipeline_advance so sa1_clock_en always fires
+    // exactly 8 CLK2 after the advance — eliminating the free-running phase mis-alignment
+    // stall (0-7 CLK2 wasted in ST_EXE_WAIT).  sa1_clock_en is latched high (sticky)
+    // once the window expires and held until the next pipeline_advance, so any instruction
+    // that takes >= 8 CLK2 (all ROM-fetch instructions) fires pipeline_advance on the
+    // very first CLK2 after it enters ST_EXE_WAIT, with no additional alignment overhead.
+    if (pipeline_advance) begin
+      sa1_cycle_r  <= 3'd0;   // restart 8-CLK2 window from this moment
+      sa1_clock_en <= 1'b0;   // consumed: clear until window expires again
+    end
+    else begin
+      sa1_cycle_r  <= sa1_cycle_r + 1;
+      if (sa1_clock_en_pre) sa1_clock_en <= 1'b1;  // latch high when window expires
+      // else: maintain current value (sticky until pipeline_advance clears it)
+    end
   end
 end
 

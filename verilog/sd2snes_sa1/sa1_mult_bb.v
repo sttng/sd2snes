@@ -1,4 +1,4 @@
-// megafunction wizard: %LPM_MULT%
+// megafunction wizard: %LPM_MULT%VBB%
 // GENERATION: STANDARD
 // VERSION: WM1.0
 // MODULE: lpm_mult 
@@ -17,7 +17,6 @@
 // 25.1std.0 Build 1129 10/21/2025 SC Lite Edition
 // ************************************************************
 
-
 //Copyright (C) 2025  Altera Corporation. All rights reserved.
 //Your use of Altera Corporation's design tools, logic functions 
 //and other software and tools, and any partner logic 
@@ -33,10 +32,6 @@
 //refer to the Altera Software License Subscription Agreements 
 //on the Quartus Prime software download page.
 
-
-// synopsys translate_off
-`timescale 1 ps / 1 ps
-// synopsys translate_on
 module sa1_mult (
 	clock,
 	dataa,
@@ -47,28 +42,6 @@ module sa1_mult (
 	input	[15:0]  dataa;
 	input	[15:0]  datab;
 	output	[31:0]  result;
-
-	wire [31:0] sub_wire0;
-	wire [31:0] result = sub_wire0[31:0];
-
-	lpm_mult	lpm_mult_component (
-				.clock (clock),
-				.dataa (dataa),
-				.datab (datab),
-				.result (sub_wire0),
-				.aclr (1'b0),
-				.clken (1'b1),
-				.sclr (1'b0),
-				.sum (1'b0));
-	defparam
-		lpm_mult_component.lpm_hint = "MAXIMIZE_SPEED=5",
-		lpm_mult_component.lpm_pipeline = 1,
-		lpm_mult_component.lpm_representation = "SIGNED",
-		lpm_mult_component.lpm_type = "LPM_MULT",
-		lpm_mult_component.lpm_widtha = 16,
-		lpm_mult_component.lpm_widthb = 16,
-		lpm_mult_component.lpm_widthp = 32;
-
 
 endmodule
 

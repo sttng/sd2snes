@@ -1,4 +1,4 @@
-// megafunction wizard: %LPM_DIVIDE%
+// megafunction wizard: %LPM_DIVIDE%VBB%
 // GENERATION: STANDARD
 // VERSION: WM1.0
 // MODULE: LPM_DIVIDE 
@@ -17,7 +17,6 @@
 // 25.1std.0 Build 1129 10/21/2025 SC Lite Edition
 // ************************************************************
 
-
 //Copyright (C) 2025  Altera Corporation. All rights reserved.
 //Your use of Altera Corporation's design tools, logic functions 
 //and other software and tools, and any partner logic 
@@ -33,10 +32,6 @@
 //refer to the Altera Software License Subscription Agreements 
 //on the Quartus Prime software download page.
 
-
-// synopsys translate_off
-`timescale 1 ps / 1 ps
-// synopsys translate_on
 module sa1_div (
 	clock,
 	denom,
@@ -49,29 +44,6 @@ module sa1_div (
 	input	[15:0]  numer;
 	output	[15:0]  quotient;
 	output	[15:0]  remain;
-
-	wire [15:0] sub_wire0;
-	wire [15:0] sub_wire1;
-	wire [15:0] quotient = sub_wire0[15:0];
-	wire [15:0] remain = sub_wire1[15:0];
-
-	lpm_divide	LPM_DIVIDE_component (
-				.clock (clock),
-				.denom (denom),
-				.numer (numer),
-				.quotient (sub_wire0),
-				.remain (sub_wire1),
-				.aclr (1'b0),
-				.clken (1'b1));
-	defparam
-		LPM_DIVIDE_component.lpm_drepresentation = "SIGNED",
-		LPM_DIVIDE_component.lpm_hint = "LPM_REMAINDERPOSITIVE=TRUE",
-		LPM_DIVIDE_component.lpm_nrepresentation = "SIGNED",
-		LPM_DIVIDE_component.lpm_pipeline = 8,
-		LPM_DIVIDE_component.lpm_type = "LPM_DIVIDE",
-		LPM_DIVIDE_component.lpm_widthd = 16,
-		LPM_DIVIDE_component.lpm_widthn = 16;
-
 
 endmodule
 
