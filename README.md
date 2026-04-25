@@ -68,20 +68,20 @@ make CONFIG=config-mk3
 `make CONFIG=config-mk3-stm32` produces `firmware.stm` for STM32
 boards (build succeeds; runtime has issues, see above).
 
-The FPGA bitfile lives at `verilog/sd2snes\_spc7110/`. Open
-`sd2snes\_spc7110.qpf` in Quartus Prime Lite 17.0.2 and run a full
-compilation. Convert the resulting `output\_files/main.rbf` to
-`fpga\_spc7110.bi3` using the `rle` tool from this repository's
+The FPGA bitfile lives at `verilog/sd2snes_spc7110/`. Open
+`sd2snes_spc7110.qpf` in Quartus Prime Lite 17.0.2 and run a full
+compilation. Convert the resulting `output_files/main.rbf` to
+`fpga_spc7110.bi3` using the `rle` tool from this repository's
 `utils/` folder.
 
-Copy `firmware.im3` (or `.stm`) and `fpga\_spc7110.bi3` to the
+Copy `firmware.im3` (or `.stm`) and `fpga_spc7110.bi3` to the
 SD card at `/sd2snes/`.
 
 ## Project layout
 
-The SPC7110 core is contained in `verilog/sd2snes\_spc7110/`. It is a
+The SPC7110 core is contained in `verilog/sd2snes_spc7110/`. It is a
 parallel implementation alongside the existing cores
-(`sd2snes\_base`, `sd2snes\_sa1`, `sd2snes\_sdd1`, etc.). The SDD1
+(`sd2snes_base`, `sd2snes_sa1`, `sd2snes_sdd1`, etc.). The SDD1
 implementation served as the architectural template.
 
 Firmware-side changes vs. stock sd2snes are limited to two files:
@@ -89,7 +89,7 @@ Firmware-side changes vs. stock sd2snes are limited to two files:
 * `src/smc.c`: SPC7110 cart detection at carttype 0xf5 / 0xf9
 * `src/fpga.h`: bitfile path constant for the SPC7110 core
 
-See `PORTING\_NOTES.md` for technical details on the non-obvious
+See `PORTING_NOTES.md` for technical details on the non-obvious
 decisions made during the port.
 
 ## Credits
@@ -97,8 +97,8 @@ decisions made during the port.
 * **ikari\_01 (mrehkopf)**: original sd2snes firmware and FPGA
 framework. This work is a fork of that repository.
 * **srg320**: the MiSTer SPC7110 VHDL implementation, from which
-the core RTL (`SPC7110.vhd`, `SPC7110\_DEC.vhd`,
-`SPC7110\_DEC\_PKG.vhd`, `SPC7110\_FIFO.vhd`, `SPC7110\_MULDIV.vhd`,
+the core RTL (`SPC7110.vhd`, `SPC7110_DEC.vhd`,
+`SPC7110_DEC_PKG.vhd`, `SPC7110_FIFO.vhd`, `SPC7110_MULDIV.vhd`,
 `SPC7110Map.vhd`, `RTC4513.vhd`) is derived.
 * The MiSTer SNES core team for the surrounding infrastructure
 and reference behaviour.
