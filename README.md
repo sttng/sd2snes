@@ -4,8 +4,7 @@ A fork of [ikari\_01's sd2snes firmware](https://github.com/mrehkopf/sd2snes)
 that adds SPC7110 coprocessor support, ported from the
 [MiSTer SNES core](https://github.com/MiSTer-devel/SNES_MiSTer) by srg320.
 
-The SPC7110 is the rarest SNES coprocessor, used by only three
-commercially released games:
+The SPC7110 is used by only three commercially released games:
 
 * Tengai Makyou Zero (JP retail; English fan translation; Shounen Jump magazine variant)
 * Super Power League 4
