@@ -142,3 +142,9 @@ verilog/*/incremental_db
 obj/
 snes/menu.rtc
 snes/menu.srm
+*.qws
+*.rbf
+*.sof
+*.pof
+*.jdi
+*.jic

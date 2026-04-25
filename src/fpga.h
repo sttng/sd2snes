@@ -48,6 +48,8 @@ extern const uint8_t *fpga_config;
 #define FPGA_GSU ((const uint8_t*)"/sd2snes/fpga_gsu." FPGA_CONF_EXT)
 #define FPGA_SA1 ((const uint8_t*)"/sd2snes/fpga_sa1." FPGA_CONF_EXT)
 #define FPGA_SDD1 ((const uint8_t*)"/sd2snes/fpga_sdd1." FPGA_CONF_EXT)
+/* SPC7110 core bitfile path (added for SPC7110 port). */
+#define FPGA_SPC7110 ((const uint8_t*)"/sd2snes/fpga_spc7110." FPGA_CONF_EXT)
 #define FPGA_SGB ((const uint8_t*)"/sd2snes/fpga_sgb." FPGA_CONF_EXT)
 #define FPGA_BASE ((const uint8_t*)"/sd2snes/fpga_base." FPGA_CONF_EXT)
 #define FPGA_DSP ((const uint8_t*)"/sd2snes/fpga_dsp." FPGA_CONF_EXT)
