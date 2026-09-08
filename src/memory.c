@@ -2128,8 +2128,8 @@ void load_dspx(const uint8_t *filename, uint8_t coretype) {
   uint16_t datdata = 0;
 
   if(coretype & FEAT_ST0010) {
-    datsize = 1536;
-    pgmsize = 2048;
+    datsize = 2048;
+    pgmsize = 16384;
   } else if (coretype & FEAT_DSPX) {
     datsize = 1024;
     pgmsize = 2048;
@@ -2144,6 +2144,15 @@ void load_dspx(const uint8_t *filename, uint8_t coretype) {
   }
 
   fpga_reset_dspx_addr();
+
+  /* Download accounting, reported below over the serial console.
+     Everything about this transfer succeeding on real hardware has so far
+     been inferred from simulation; this makes it directly observable.
+     A short word_cnt means the file was truncated or the read failed
+     partway, which would leave the DSP executing unprogrammed SRAM. */
+  {
+    uint32_t pgm_checksum = 0;
+    uint16_t pgm_words_sent = 0;
 
   for(word_cnt = 0; word_cnt < pgmsize;) {
     if(!sector_remaining) {
@@ -2160,7 +2169,61 @@ void load_dspx(const uint8_t *filename, uint8_t coretype) {
       wordsize_cnt = 0;
       word_cnt++;
       fpga_write_dspx_pgm(pgmdata);
+      pgm_checksum += (pgmdata & 0xffffff);
+      pgm_words_sent++;
     }
+  }
+
+  printf("load_dspx: %s pgm words sent=%u (expected %u) checksum=%08lx\n",
+         filename, pgm_words_sent, pgmsize, (unsigned long)pgm_checksum);
+  if(pgm_words_sent != pgmsize) {
+    printf("load_dspx: WARNING short program transfer -- DSP will execute unprogrammed memory\n");
+  }
+
+  /* Read the program back OUT of the SRAM and compare. The checksum above
+     only proves what was SENT; this proves what actually landed. */
+  /* Set to 1 to re-enable the SRAM readback verification sweep.
+     DISABLED BY DEFAULT: it has already served its purpose (both ST010
+     and ST011 verified MATCH), and running it introduced NEW graphical
+     glitches in ST010 -- 16384 back-to-back SRAM reads at load time are
+     evidently disruptive on their own. That side effect is itself a
+     clue about the remaining ST011 fault; see FINAL_STATUS.md. */
+#define DSPX_VERIFY_SRAM 0
+#if DSPX_VERIFY_SRAM
+  if(coretype & FEAT_ST0010) {
+    uint32_t sram_sum = fpga_dspx_verify_sram();
+    int rep;
+    /* Printed repeatedly, and framed by markers, because the serial link
+       has been corrupting single characters -- one intact copy out of
+       several is enough, and a corrupted hex digit in this value would
+       send us chasing a fault that isn't there. */
+    for(rep = 0; rep < 5; rep++) {
+      printf(">>>VSUM<<< sram=%08lx sent=%08lx %s >>>END<<<\n",
+             (unsigned long)sram_sum, (unsigned long)pgm_checksum,
+             (sram_sum == pgm_checksum) ? "MATCH" : "MISMATCH");
+    }
+    /* Also write the result to the SD card. The serial link has been
+       corrupting characters badly enough that a checksum read off it
+       cannot be trusted, and a wrong hex digit here would send us
+       chasing a fault that does not exist. A file is reliable and can
+       just be read on a PC. */
+    {
+      UINT bw;
+      int n = snprintf((char*)file_buf, 128,
+                       "sram=%08lx\nsent=%08lx\nresult=%s\n",
+                       (unsigned long)sram_sum, (unsigned long)pgm_checksum,
+                       (sram_sum == pgm_checksum) ? "MATCH" : "MISMATCH");
+      file_open((uint8_t*)"/sd2snes/vsum.txt", FA_CREATE_ALWAYS | FA_WRITE);
+      if(!file_res) {
+        f_write(&file_handle, file_buf, n, &bw);
+        file_close();
+        printf("load_dspx: wrote /sd2snes/vsum.txt\n");
+      } else {
+        printf("load_dspx: could not write vsum.txt, res=%d\n", file_res);
+      }
+    }
+  }
+#endif
   }
 
   wordsize_cnt = 0;
@@ -2168,6 +2231,10 @@ void load_dspx(const uint8_t *filename, uint8_t coretype) {
     file_seek(0xc000);
     sector_remaining = 0;
   }
+
+  {
+    uint32_t dat_checksum = 0;
+    uint16_t dat_words_sent = 0;
 
   for(word_cnt = 0; word_cnt < datsize;) {
     if(!sector_remaining) {
@@ -2184,7 +2251,19 @@ void load_dspx(const uint8_t *filename, uint8_t coretype) {
       wordsize_cnt = 0;
       word_cnt++;
       fpga_write_dspx_dat(datdata);
+      dat_checksum += datdata;
+      dat_words_sent++;
     }
+  }
+
+  /* ST011 uses the data ROM as its command jump table, so a failure here
+     breaks dispatch specifically -- which is the observed symptom. Just
+     as unverified on hardware as the program transfer, so report it too. */
+  printf("load_dspx: dat words sent=%u (expected %u) checksum=%08lx\n",
+         dat_words_sent, datsize, (unsigned long)dat_checksum);
+  if(dat_words_sent != datsize) {
+    printf("load_dspx: WARNING short data transfer\n");
+  }
   }
 
   fpga_reset_dspx_addr();

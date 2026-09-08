@@ -338,12 +338,16 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
       /* ST0011 LoROM */
       else if (header->map == 0x30 && header->carttype == 0xf6 && header->romsize < 0xa) {
         props->has_dspx = 1;
+        /* uPD96050 family: identical FPGA-side bus decode, external-fetch
+           path, SaveRAM sizing and savestate limitations as ST0010 (see
+           savestate.c's dsp_ok check, which gates on has_st0010) -- only
+           the firmware filename differs, via dsp_fw below. */
+        props->has_st0010 = 1;
         props->has_st0011 = 1;
         props->dsp_fw = DSPFW_ST0011;
         props->fpga_conf = FPGA_DSP;
-       // props->fpga_features |= FEAT_ST0011;
-        props->error = MENU_ERR_NOIMPL;
-        props->error_param = (uint8_t*)"ST0011";
+        props->fpga_features |= FEAT_ST0010;
+        header->ramsize = 2;
       }
       /* ST0018 LoROM */
       else if (header->map == 0x30 && header->carttype == 0xf5) {
@@ -526,9 +530,37 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
     props->fpga_features |= FEAT_SRTC;
   }
 
-  /* ~12.5MHz for ST0010, 8MHz for DSPx */
+  /* ~12.5MHz for ST0010/ST0011 (uPD96050 family), 8MHz for DSPx.
+     ST0011's real clock is faster still (~22MHz vs ST0010's ~11MHz).
+
+     BOTH are now 0, and the earlier reasoning here was backwards.
+
+     The old comment claimed this core issues a cached instruction in ~2
+     cycles (~21ns), i.e. several times FASTER than the real chip, and
+     therefore needed throttling.  It does not.  The core runs an
+     unconditional state sequence per instruction plus an external-fetch
+     stall; before the throughput fix in upd77c25.v that was ten cycles,
+     ~104ns, and even at cpu_wait=0 it was well SLOWER than the real
+     ST011's ~45ns.  Every waitstate value only made it slower still,
+     which is why sweeping 2/4/7 produced no change at all: 0 and 2 were
+     in fact identical (the fetch stall masked anything below 3), and the
+     whole range sat below the rate ST011 needs.
+
+     ST011 needs that rate.  Its host protocol is DMA-paced with no
+     handshake -- the MesenCE trace shows a host access to DR every 8 DSP
+     instructions, never fewer, against a 4-instruction transfer loop.
+     Run slower than that and DR is overwritten before the DSP consumes
+     it, the loop counter never reaches zero, and the DSP hangs in JRQM.
+
+     So: no artificial throttle.  If a future core is fast enough that
+     something wants slowing down, this is still the lever (0-15, ~10.4ns
+     per unit at 96MHz), but sweep it upward from 0 only with evidence,
+     and re-read upd77c25.v's THROUGHPUT note first. */
+#define ST0011_WAITSTATES 0
   if(props->has_dspx) {
-    if(props->has_st0010) {
+    if(props->has_st0011) {
+      props->fpga_dspfeat = ST0011_WAITSTATES;
+    } else if(props->has_st0010) {
       props->fpga_dspfeat = 0;
     } else {
       props->fpga_dspfeat = 4; /* 4 extra waitstates */

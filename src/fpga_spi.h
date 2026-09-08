@@ -143,6 +143,12 @@
 #define FPGA_SPC7110_RTC_LEN     (8)
 #define FPGA_CMD_DSPRESETPTR     (0xe8)
 #define FPGA_CMD_DSPWRITEPGM     (0xe9)
+/* External-program-SRAM readback verification: $e5 starts a sweep that
+   reads every word back OUT of the SRAM and checksums it; $f5 reads the
+   result. The $e9 download path can only prove what was SENT -- this
+   proves what actually landed in the chip. */
+#define FPGA_CMD_DSPVSUM_START   (0xe5)
+#define FPGA_CMD_DSPVSUM_READ    (0xf5)
 #define FPGA_CMD_DSPWRITEDAT     (0xea)
 #define FPGA_CMD_DSPRESET        (0xeb)
 #define FPGA_CMD_DACBOOST        (0xec)
@@ -217,6 +223,7 @@ void set_bsx_regs(uint8_t set, uint8_t reset);
 void fpga_reset_srtc_state(void);
 void fpga_reset_dspx_addr(void);
 void fpga_write_dspx_pgm(uint32_t data);
+uint32_t fpga_dspx_verify_sram(void);
 void fpga_write_dspx_dat(uint16_t data);
 void fpga_dspx_reset(uint8_t reset);
 void fpga_dspx_ss_halt(uint8_t halt);

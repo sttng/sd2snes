@@ -516,6 +516,64 @@ void fpga_reset_dspx_addr() {
   FPGA_DESELECT();
 }
 
+/* Start the external-program-SRAM readback sweep, wait for it to finish,
+   and return the 32-bit checksum of what the SRAM actually contains.
+   Compare against the checksum load_dspx computed while sending: a match
+   proves the download landed intact; a mismatch localises the fault to
+   the FPGA<->SRAM path. */
+uint32_t fpga_dspx_verify_sram(void) {
+  uint32_t sum = 0;
+  uint32_t timeout;
+  uint8_t status;
+
+  FPGA_SELECT();
+  FPGA_TX_BYTE(FPGA_CMD_DSPVSUM_START);
+  FPGA_TX_BYTE(0x00);   /* byte 2: FPGA asserts vsum_start here */
+  FPGA_TX_BYTE(0x00);   /* byte 3: FPGA clears it */
+  FPGA_TX_BYTE(0x00);
+  FPGA_DESELECT();
+
+  /* Wait for the sweep to ASSERT busy first. Polling only for "not busy"
+     is wrong: the first poll can easily arrive before the FPGA has
+     started, read busy=0, and exit immediately with a zero checksum --
+     which looks exactly like "the SRAM is empty" while actually meaning
+     "we never waited". */
+  for(timeout = 0; timeout < 100000; timeout++) {
+    FPGA_SELECT();
+    FPGA_TX_BYTE(FPGA_CMD_DSPVSUM_READ);
+    status = FPGA_RX_BYTE();
+    FPGA_DESELECT();
+    if(status & 1) break;
+  }
+  if(timeout >= 100000) {
+    printf("fpga_dspx_verify_sram: sweep never started (busy never asserted)\n");
+    return 0xfffffffe;
+  }
+
+  /* now wait for it to finish */
+  for(timeout = 0; timeout < 2000000; timeout++) {
+    FPGA_SELECT();
+    FPGA_TX_BYTE(FPGA_CMD_DSPVSUM_READ);
+    status = FPGA_RX_BYTE();
+    FPGA_DESELECT();
+    if(!(status & 1)) break;
+  }
+  if(timeout >= 2000000) {
+    printf("fpga_dspx_verify_sram: TIMEOUT waiting for sweep to finish\n");
+    return 0xffffffff;
+  }
+
+  FPGA_SELECT();
+  FPGA_TX_BYTE(FPGA_CMD_DSPVSUM_READ);
+  FPGA_RX_BYTE();                     /* status byte */
+  sum  = (uint32_t)FPGA_RX_BYTE() << 24;
+  sum |= (uint32_t)FPGA_RX_BYTE() << 16;
+  sum |= (uint32_t)FPGA_RX_BYTE() << 8;
+  sum |= (uint32_t)FPGA_RX_BYTE();
+  FPGA_DESELECT();
+  return sum;
+}
+
 void fpga_write_dspx_pgm(uint32_t data) {
   FPGA_SELECT();
   FPGA_TX_BYTE(FPGA_CMD_DSPWRITEPGM);
