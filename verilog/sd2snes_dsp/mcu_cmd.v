@@ -82,8 +82,12 @@ module mcu_cmd(
 
   // uPD77C25
   output reg [23:0] dspx_pgm_data_out,
-  output reg [10:0] dspx_pgm_addr_out,
+  output reg [13:0] dspx_pgm_addr_out,
   output reg dspx_pgm_we_out,
+  // external-program-SRAM readback verification (see $F5 / $EA below)
+  output reg dspx_vsum_start = 1'b0,
+  input dspx_vsum_busy,
+  input [31:0] dspx_vsum,
 
   output reg [15:0] dspx_dat_data_out,
   output reg [10:0] dspx_dat_addr_out,
@@ -115,7 +119,7 @@ module mcu_cmd(
 );
 
 initial begin
-  dspx_pgm_addr_out = 11'b00000000000;
+  dspx_pgm_addr_out = 14'b0;
   dspx_dat_addr_out = 10'b0000000000;
   dspx_reset_out = 1'b1;
   region_out = 0;
@@ -335,7 +339,7 @@ always @(posedge clk) begin
       8'he8: begin// reset DSPx PGM+DAT address
         case (spi_byte_cnt)
           32'h2: begin
-            dspx_pgm_addr_out <= 11'b00000000000;
+            dspx_pgm_addr_out <= 14'b0;
             dspx_dat_addr_out <= 10'b0000000000;
           end
         endcase
@@ -350,6 +354,15 @@ always @(posedge clk) begin
             dspx_pgm_we_out <= 1'b0;
             dspx_pgm_addr_out <= dspx_pgm_addr_out + 1;
           end
+        endcase
+      8'he5:// start external-program-SRAM readback verification sweep
+        // NOTE: this block is the param_ready path, which only runs for
+        // bytes AFTER the command byte -- hence counts start at 2, the
+        // same as $e9 above. Triggering at count 1 (as an earlier version
+        // did) never fires at all.
+        case (spi_byte_cnt)
+          32'h2: dspx_vsum_start <= 1'b1;
+          32'h3: dspx_vsum_start <= 1'b0;
         endcase
       8'hea:// write DSPx DAT w/ increment
         case (spi_byte_cnt)
@@ -494,6 +507,24 @@ always @(posedge clk) begin
       endcase
     else if (cmd_data[7:0] == 8'hF4)
       MCU_DATA_IN_BUF <= msu_volumerq;
+    /* $F5: read back the external-program-SRAM verification result.
+       Byte 1 = status (bit0 = sweep busy), bytes 2-5 = 32-bit checksum of
+       every word READ BACK from the SRAM. The existing $E9 download path
+       only proves what the MCU SENT; this proves what actually landed in
+       the chip, which is the one link never verified on hardware. */
+    else if (cmd_data[7:0] == 8'hF5)
+      case (spi_byte_cnt)
+        32'h1:
+          MCU_DATA_IN_BUF <= {7'b0, dspx_vsum_busy};
+        32'h2:
+          MCU_DATA_IN_BUF <= dspx_vsum[31:24];
+        32'h3:
+          MCU_DATA_IN_BUF <= dspx_vsum[23:16];
+        32'h4:
+          MCU_DATA_IN_BUF <= dspx_vsum[15:8];
+        32'h5:
+          MCU_DATA_IN_BUF <= dspx_vsum[7:0];
+      endcase
     else if (cmd_data[7:0] == 8'hFE)
       case (spi_byte_cnt)
         32'h1:

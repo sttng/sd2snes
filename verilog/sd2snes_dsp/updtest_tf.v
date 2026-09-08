@@ -34,7 +34,7 @@ module updtest;
   reg CLK;
   reg PGM_WR;
   reg [23:0] PGM_DI;
-  reg [10:0] PGM_WR_ADDR;
+  reg [13:0] PGM_WR_ADDR;
   reg DAT_WR;
   reg [15:0] DAT_DI;
   reg [9:0] DAT_WR_ADDR;

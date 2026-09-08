@@ -250,17 +250,27 @@ assign dspx_enable =
         & &SNES_ADDR[14:13])
     :1'b0)
   :featurebits[FEAT_ST0010]
-  ?(SNES_ADDR[22] & SNES_ADDR[21] & ~SNES_ADDR[20] & &(~SNES_ADDR[19:16]) & ~SNES_ADDR[15])
+  // ST010/ST011: DR at $60:0000, SR at $60:0001, mirrored at $E0.
+  // Window is $0000-$0FFF, matching the hardware decode (and Mesen's
+  // 0x60,0x0000-0x0FFF handler) -- NOT the full $0000-$7FFF this used
+  // to accept. Reads and writes here have side effects (a DR access
+  // clears RQM), so an 8x-too-wide window means any stray access
+  // anywhere in 32KB silently advances the handshake.
+  ?(SNES_ADDR[22] & SNES_ADDR[21] & ~SNES_ADDR[20] & &(~SNES_ADDR[19:16])
+    & (SNES_ADDR[15:12] == 4'b0000))
   :1'b0;
 
-// Data-RAM / savestate-scan window, offset $0000-$07FF.
+// Data-RAM / savestate-scan window.
 // ST0010: always, at banks $68-$6F/$E8-$EF (its data RAM is exposed here).
-// DSP1-4 (FEAT_DSPX): only the $E8 savestate-scan window (SS_DSP_WINDOW), and
-//   only while unlocked (handler holds map_unlock/snescmd_unlock), so it can
+//   Window is $0000-$0FFF (4KB): the uPD96050's data RAM is 2048 x 16-bit
+//   words, addressed as 4096 bytes.
+// DSP1-4 (FEAT_DSPX): only the $E8 savestate-scan window (SS_DSP_WINDOW),
+//   offset $0000-$07FF (2KB) -- this protocol's size is independent of the
+//   uPD77C25's actual (much smaller) working RAM, so it is left unchanged.
+//   Only while unlocked (handler holds map_unlock/snescmd_unlock), so it can
 //   never alias the game-readable LoROM band $68-$6F during normal play.
-assign dspx_dp_enable = (SNES_ADDR[15:11] == 5'b00000)
-                      & ( (featurebits[FEAT_ST0010] & (SNES_ADDR[22:19] == 4'b1101))
-                        | (featurebits[FEAT_DSPX] & (map_unlock | snescmd_unlock) & (SNES_ADDR[23:16] == 8'hE8)) );
+assign dspx_dp_enable = (featurebits[FEAT_ST0010] & (SNES_ADDR[15:12] == 4'b0000) & (SNES_ADDR[22:19] == 4'b1101))
+                      | (featurebits[FEAT_DSPX] & (SNES_ADDR[15:11] == 5'b00000) & (map_unlock | snescmd_unlock) & (SNES_ADDR[23:16] == 8'hE8));
 
 assign dspx_a0 = featurebits[FEAT_CC92] ? SNES_ADDR[14]
                  : featurebits[FEAT_PF94] ? SNES_ADDR[12]

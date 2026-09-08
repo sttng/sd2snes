@@ -31,16 +31,33 @@ module upd77c25(
 
   input PGM_WR,
   input [23:0] PGM_DI,
-  input [10:0] PGM_WR_ADDR,
+  input [13:0] PGM_WR_ADDR,
+
+  // external-program-SRAM readback verification (passed to extpgm)
+  output psram_rrq,
+  output [23:0] psram_addr,
+  input [15:0] psram_din,
+  input psram_rdy,
+
+  input vsum_start,
+  output vsum_busy,
+  output [31:0] vsum,
 
   input DAT_WR,
   input [15:0] DAT_DI,
   input [10:0] DAT_WR_ADDR,
 
   input DP_enable,
-  input [10:0] DP_ADDR,
+  input [11:0] DP_ADDR,
 
   input [15:0] dsp_feat,
+
+  // external program memory (ST010/ST011 only -- see upd77c25_extpgm.v)
+  input ext_pgm_en,
+  output [18:0] RAM_ADDR,
+  inout [7:0] RAM_DATA,
+  output RAM_OE,
+  output RAM_WE,
 
   // savestate scan port (Phase 1: read-only)
   input ss_halt,        // MCU debug halt request
@@ -50,7 +67,7 @@ module upd77c25(
   // debug
   output [15:0] updDR,
   output [15:0] updSR,
-  output [10:0] updPC,
+  output [13:0] updPC,
   output [15:0] updA,
   output [15:0] updB,
   output [5:0] updFL_A,
@@ -65,6 +82,35 @@ parameter STATE_STORE = 8'b00010000;
 parameter STATE_NEXT  = 8'b00100000;
 parameter STATE_IDLE1 = 8'b01000000;
 parameter STATE_IDLE2 = 8'b10000000;
+
+// STATE_ALU2 exists only as a dead cycle: its entire body is
+// "insn_state <= STATE_STORE". Everything STATE_STORE consumes (alu_p,
+// alu_q, cond_true) is registered at the STATE_ALU1 edge and is therefore
+// already valid without it, and the one signal that used the ALU1|ALU2
+// window -- the KLM second data-RAM read address in ram_addra -- still
+// presents its address for a full cycle before STATE_STORE samples
+// ram_douta. Set to 0 to restore the extra cycle; that is the only
+// difference, so it is a one-line revert if this is ever suspect.
+parameter SKIP_ALU2 = 1;
+
+// Publish pc_next to the fetch unit during STATE_STORE, a cycle before
+// `pc` takes it, so a cache hit costs no stall cycles in STATE_NEXT.
+// Set to 0 to fall back to looking up only once pc has changed; both are
+// functionally correct, they differ only in cycles per instruction.
+// Kept as parameters so st011_rate_tb can A/B them without editing.
+parameter PC_LOOKAHEAD = 1;
+
+// Passed through to upd77c25_extpgm. 0 removes the one-shot cache
+// prewarm; see that module's PREWARM block for what it is for.
+parameter PREWARM_ENABLE = 1;
+
+// Passed through to upd77c25_extpgm. 1 reads every MISSED word twice and
+// commits only on agreement; 0 reads it once. 0 halves the cost of a
+// cache miss (60.5 -> 31.0 cycles at 96MHz) and is the setting ST011
+// needs -- see that module's READ_VERIFY comment for the measurements
+// and for why the SRAM-integrity hypothesis it was built to test is no
+// longer live.
+parameter READ_VERIFY = 0;
 
 parameter I_OP = 2'b00;
 parameter I_RT = 2'b01;
@@ -82,11 +128,13 @@ reg [1:0] flags_c;
 reg [1:0] flags_s0;
 reg [1:0] flags_s1;
 
-reg [10:0] pc;        // program counter
+reg [13:0] pc;        // program counter (14 bits: covers DSP1-4's 2K-word space
+                       // as well as ST010/ST011's 16K-word space)
 
 reg [7:0] insn_state; // execute state
 
-reg [1:0] regs_dpb;
+reg [2:0] regs_dpb;  // widened 2->3 bits: DSP1-4 RAM is 1K words
+                     // (dpb+dph+dpl=10b); ST010/ST011 RAM is 2K words (11b)
 reg [3:0] regs_dph;
 reg [3:0] regs_dpl;
 
@@ -103,10 +151,10 @@ wire [23:0] pgm_doutb;
 upd77c25_pgmrom pgmrom (
   .clka(CLK), // input clka
   .wea(PGM_WR), // input [0 : 0] wea
-  .addra(PGM_WR_ADDR), // input [10 : 0] addra
+  .addra(PGM_WR_ADDR[10:0]), // input [10 : 0] addra
   .dina(PGM_DI), // input [23 : 0] dina
   .clkb(CLK), // input clkb
-  .addrb(pc), // input [10 : 0] addrb
+  .addrb(pc[10:0]), // input [10 : 0] addrb
   .doutb(pgm_doutb) // output [23 : 0] doutb
 );
 `endif
@@ -115,14 +163,78 @@ upd77c25_pgmrom pgmrom (
 upd77c25_pgmrom pgmrom (
   .clock(CLK), // input clka
   .wren(PGM_WR), // input [0 : 0] wea
-  .wraddress(PGM_WR_ADDR), // input [10 : 0] addra
+  .wraddress(PGM_WR_ADDR[10:0]), // input [10 : 0] addra
   .data(PGM_DI), // input [23 : 0] dina
-  .rdaddress(pc), // input [10 : 0] addrb
+  .rdaddress(pc[10:0]), // input [10 : 0] addrb
   .q(pgm_doutb) // output [23 : 0] doutb
 );
 `endif
 
-wire [23:0] opcode_w = pgm_doutb;
+// External program fetch (ST010/ST011 only): the on-chip pgmrom above only
+// ever holds 2048 words (DSP1-4's actual size). ST010/ST011 firmware is up
+// to 16384 words and lives in the board's separate, otherwise-unused Bus 2
+// SRAM (RAM_ADDR/RAM_DATA/RAM_OE/RAM_WE), addressed byte-wise (3 bytes per
+// 24-bit instruction). See upd77c25_extpgm.v.
+wire [23:0] ext_pgm_dout;
+wire ext_pgm_ready;
+wire ext_pgm_busy_wr;
+
+// ---- THROUGHPUT (ST011) ------------------------------------------------
+//
+// ST011 talks to the SNES entirely through DR/SR, and it does so on a
+// DMA-paced schedule with no handshake. The MesenCE reference trace shows
+// a host access to DR every 8 DSP instructions -- 309 of 399 gaps are
+// exactly 8, and none is ever less -- while the DSP's transfer loops
+// (words 197-200 in, 243-246 out) are 4 instructions long. So the core
+// must sustain at least one instruction per two host-access-eighths, or
+// DR is overwritten before it is consumed; the loop counter then never
+// reaches zero and the DSP parks in JRQM forever, which is exactly the
+// hang this core exhibited.
+//
+// At 96MHz the budget is about 4.5 cycles per instruction. The state
+// sequence below was seven states plus a three-cycle external-fetch stall
+// = ten cycles, i.e. 2.5x too slow, and no cpu_wait value could fix that
+// because cpu_wait only ever makes it slower. Two changes bring it to
+// six: SKIP_ALU2 removes a state that did nothing, and pc_next is
+// published to the fetch unit a cycle early so a cache hit costs zero
+// stall cycles. See upd77c25_extpgm.v's CACHE LOOKUP TIMING note.
+//
+// ST010 is unaffected either way: it communicates through its data RAM
+// window and barely touches DR at all, which is also why it kept working
+// throughout while ST011 never did.
+wire [13:0] pc_next;        // combinational next-pc, valid in STATE_STORE
+wire pc_early_valid;
+
+upd77c25_extpgm #(.PREWARM_ENABLE(PREWARM_ENABLE),
+                  .READ_VERIFY(READ_VERIFY)) extpgm (
+  .CLK(CLK),
+  .psram_rrq(psram_rrq),
+  .psram_addr(psram_addr),
+  .psram_din(psram_din),
+  .psram_rdy(psram_rdy),
+  .vsum_start(vsum_start),
+  .vsum_busy(vsum_busy),
+  .vsum(vsum),
+  .enable(ext_pgm_en),
+
+  .pc(pc),
+  .pc_early(pc_next),
+  .pc_early_valid(pc_early_valid),
+  .dout(ext_pgm_dout),
+  .ready(ext_pgm_ready),
+
+  .PGM_WR(PGM_WR),
+  .PGM_DI(PGM_DI),
+  .PGM_WR_ADDR(PGM_WR_ADDR),
+  .wr_busy(ext_pgm_busy_wr),
+
+  .RAM_ADDR(RAM_ADDR),
+  .RAM_DATA(RAM_DATA),
+  .RAM_OE(RAM_OE),
+  .RAM_WE(RAM_WE)
+);
+
+wire [23:0] opcode_w = ext_pgm_en ? ext_pgm_dout : pgm_doutb;
 reg [1:0] op;
 reg [1:0] op_pselect;
 reg [3:0] op_alu;
@@ -134,6 +246,15 @@ reg [3:0] op_src;
 reg [3:0] op_dst;
 
 wire [15:0] dat_doutb;
+// Corrects the same byte-order mismatch as program ROM (ares's dump
+// format is little-endian, this loader's assembly path is big-endian --
+// see upd77c25_extpgm.v's header comment for the full derivation),
+// confirmed numerically against the actual firmware dump: every
+// asymmetric data-ROM word arrives as {true[7:0], true[15:8]} instead of
+// true. Data ROM's on-chip storage doesn't transform bytes at all (unlike
+// program ROM's 3-byte SRAM serialization), so the correction has to
+// happen here, at the point of consumption, rather than in the write path.
+wire [15:0] dat_doutb_fixed = {dat_doutb[7:0], dat_doutb[15:8]};
 
 `ifdef MK2
 `ifndef DEBUG
@@ -160,7 +281,7 @@ upd77c25_datrom datrom (
 `endif
 
 wire [15:0] ram_douta;
-wire [9:0] ram_addra;
+wire [10:0] ram_addra;
 reg [7:0] DP_DOr;
 wire [7:0] DP_DO;
 wire [7:0] UPD_DO;
@@ -179,12 +300,12 @@ wire ram_web = reg_we_rising & DP_enable & ~ss_regwin & ~ss_ctrl;
 upd77c25_datram datram (
   .clka(CLK), // input clka
   .wea(ram_wea), // input [0 : 0] wea
-  .addra(ram_addra), // input [9 : 0] addra
+  .addra(ram_addra), // input [10 : 0] addra
   .dina(ram_dina), // input [15 : 0] dina
   .douta(ram_douta), // output [15 : 0] douta
   .clkb(CLK), // input clkb
   .web(ram_web), // input [0 : 0] web
-  .addrb(DP_ADDR), // input [10 : 0] addrb
+  .addrb(DP_ADDR), // input [11 : 0] addrb
   .dinb(DI), // input [7 : 0] dinb
   .doutb(DP_DO) // output [7 : 0] doutb
 );
@@ -194,11 +315,11 @@ upd77c25_datram datram (
 upd77c25_datram datram (
   .clock(CLK), // input clka
   .wren_a(ram_wea), // input [0 : 0] wea
-  .address_a(ram_addra), // input [9 : 0] addra
+  .address_a(ram_addra), // input [10 : 0] addra
   .data_a(ram_dina), // input [15 : 0] dina
   .q_a(ram_douta), // output [15 : 0] douta
   .wren_b(ram_web), // input [0 : 0] web
-  .address_b(DP_ADDR), // input [10 : 0] addrb
+  .address_b(DP_ADDR), // input [11 : 0] addrb
   .data_b(DI), // input [7 : 0] dinb
   .q_b(DP_DO) // output [7 : 0] doutb
 );
@@ -219,12 +340,48 @@ reg [15:0] regs_trb;
 reg [15:0] regs_tr;
 reg [15:0] regs_dr;
 reg [15:0] regs_sr;
+reg [15:0] regs_so;   // serial output; only meaningful use in this core is
+                       // as JMPSO's jump target (opcode $000). Real serial
+                       // I/O is not implemented, matching ares.
+reg [15:0] regs_si;   // serial input; read-only from the instruction set's
+                       // perspective (no dst opcode ever writes it -- real
+                       // hardware fills it from external serial traffic).
+                       // Real serial I/O isn't implemented (matching ares),
+                       // but SO is NOT dead: destinations 8 and 9 (SOL/SOM)
+                       // write it, and JMPSO jumps to it. ST011's entire
+                       // command dispatch is a JMPSO through a data-ROM
+                       // jump table (trace: word 19), so this register is
+                       // load-bearing -- do not optimise it away.
 reg [3:0] regs_sp;
 
 reg cond_true;
 
 reg [8:0] jp_brch;
 reg [10:0] jp_na;
+reg [1:0] jp_bank;    // opcode[1:0]: program-page bank bits, only non-zero on
+                       // ST010/ST011 (16K program space); always 0 for DSP1-4
+
+// jp_brch top 3 bits: 100=JP, 101=CALL (matches the existing call-push check
+// below). Bit 0 of the full 9-bit field distinguishes the page-clear ($x00)
+// from the page-set ($x01) opcode variant for those two unconditional forms.
+wire jp_page_explicit = (jp_brch[8:6] == 3'b100) | (jp_brch[8:6] == 3'b101);
+wire jp_page_bit = jp_page_explicit ? jp_brch[0] : pc[13];
+wire [13:0] jp_target = {jp_page_bit, jp_bank, jp_na};
+
+// The next pc, computed combinationally so it can be published to the
+// fetch unit during STATE_STORE -- one cycle before `pc` itself takes it.
+// STATE_STORE assigns `pc <= pc_next` for every instruction form, so this
+// wire and the register can never disagree.
+//
+// Everything it depends on is stable by STATE_STORE: cond_true and the
+// jp_* fields are registered in STATE_ALU1 and STATE_FETCH respectively,
+// and regs_sp/stack are only modified by this same STATE_STORE assignment.
+assign pc_next =
+    (op == I_RT) ? stack[regs_sp-1]
+  : (op == I_JP) ? (cond_true ? ((jp_brch == 9'b0) ? regs_so[13:0] : jp_target)
+                              : (pc + 14'd1))
+  :                (pc + 14'd1);
+assign pc_early_valid = (PC_LOOKAHEAD != 0) && (insn_state == STATE_STORE);
 
 reg [15:0] ld_id;
 reg [3:0] ld_dst;
@@ -236,10 +393,19 @@ reg [15:0] regs_n;
 reg [15:0] alu_p;
 reg [15:0] alu_q;
 reg [15:0] alu_r;
+// Fresh (this-instruction) overflow, for the arithmetic ALU ops
+// (SUB/ADD/SBB/ADC/DEC/INC). Needed as a combinational value separate
+// from flags_ov0 itself, since flags_ov1's correct update (see the
+// STATE_FETCH block below) depends on comparing this instruction's own
+// overflow against the OLD flags_ov1 within the same clock edge --
+// something a non-blocking-assigned register can't supply to itself.
+wire alu_ov0_arith = op_alu[0]
+  ? (alu_q[15] ^ alu_r[15]) & ~(alu_q[15] ^ alu_p[15])
+  : (alu_q[15] ^ alu_r[15]) & (alu_q[15] ^ alu_p[15]);
 
 reg [1:0] alu_store;
 
-reg [10:0] stack [15:0];
+reg [13:0] stack [15:0];
 
 reg [15:0] idb;
 
@@ -270,7 +436,7 @@ assign updFL_B = {flags_s1[1],flags_s0[1],flags_c[1],flags_z[1],flags_ov1[1],fla
 reg ss_halt_snes;
 initial ss_halt_snes = 1'b0;
 wire ss_halt_eff = ss_halt | ss_halt_snes;
-assign ss_ctrl = ss_window_en & DP_enable & (DP_ADDR == 11'h7ff);
+assign ss_ctrl = ss_window_en & DP_enable & (DP_ADDR == 12'h7ff);
 always @(posedge CLK) begin
   if(~RST) ss_halt_snes <= 1'b0;
   else if(ss_ctrl & reg_we_rising) ss_halt_snes <= DI[0];
@@ -305,14 +471,14 @@ reg [7:0] ss_reg_do;
 // (Xst:902 "Unexpected ... event"); Quartus (mk3) tolerates it.  Behavior-neutral.
 wire [15:0] ss_rab0 = regs_ab[0];
 wire [15:0] ss_rab1 = regs_ab[1];
-wire [10:0] ss_stk  = stack[ss_stk_idx];
+wire [13:0] ss_stk  = stack[ss_stk_idx];
 always @(*) begin
   if (DP_ADDR[7:0] >= 8'h34 && DP_ADDR[7:0] <= 8'h53)
-    ss_reg_do = DP_ADDR[0] ? {5'b0, ss_stk[10:8]}
+    ss_reg_do = DP_ADDR[0] ? {2'b0, ss_stk[13:8]}
                            : ss_stk[7:0];
   else case (DP_ADDR[7:0])
     8'h00: ss_reg_do = pc[7:0];
-    8'h01: ss_reg_do = {5'b0, pc[10:8]};
+    8'h01: ss_reg_do = {2'b0, pc[13:8]};
     8'h02: ss_reg_do = ss_rab0[7:0];
     8'h03: ss_reg_do = ss_rab0[15:8];
     8'h04: ss_reg_do = ss_rab1[7:0];
@@ -336,7 +502,7 @@ always @(*) begin
     8'h16: ss_reg_do = regs_n[7:0];
     8'h17: ss_reg_do = regs_n[15:8];
     8'h18: ss_reg_do = {regs_dph, regs_dpl};
-    8'h19: ss_reg_do = {6'b0, regs_dpb};
+    8'h19: ss_reg_do = {5'b0, regs_dpb};
     8'h1a: ss_reg_do = {4'b0, regs_sp};
     8'h1b: ss_reg_do = insn_state;
     8'h1c: ss_reg_do = {2'b0, updFL_A};
@@ -358,11 +524,15 @@ always @(*) begin
     8'h2c: ss_reg_do = {op_src, op_dst};
     8'h2d: ss_reg_do = {ld_dst, 1'b0, alu_store, cond_true};
     8'h2e: ss_reg_do = jp_brch[7:0];
-    8'h2f: ss_reg_do = {7'b0, jp_brch[8]};
+    8'h2f: ss_reg_do = {5'b0, jp_bank, jp_brch[8]};
     8'h30: ss_reg_do = jp_na[7:0];
     8'h31: ss_reg_do = {5'b0, jp_na[10:8]};
     8'h32: ss_reg_do = {4'b0, cpu_wait};
     8'h33: ss_reg_do = 8'hd1; // magic, sanity-check on restore
+    8'h54: ss_reg_do = regs_so[7:0];
+    8'h55: ss_reg_do = regs_so[15:8];
+    8'h56: ss_reg_do = regs_si[7:0];
+    8'h57: ss_reg_do = regs_si[15:8];
     default: ss_reg_do = 8'h00;
   endcase
 end
@@ -372,10 +542,10 @@ initial begin
   alu_store = 2'b11;
   insn_state = STATE_IDLE1;
   regs_sp = 4'b0000;
-  pc = 11'b0;
+  pc = 14'b0;
   regs_sr = 16'b0;
   regs_rp = 16'h0000;
-  regs_dpb = 2'b0;
+  regs_dpb = 3'b0;
   regs_dph = 4'b0;
   regs_dpl = 4'b0;
   regs_k = 16'b0;
@@ -391,6 +561,8 @@ initial begin
   regs_tr = 16'b0;
   regs_trb = 16'b0;
   regs_dr = 16'b0;
+  regs_so = 16'b0;
+  regs_si = 16'b0;
 end
 
 always @(posedge CLK) begin
@@ -465,6 +637,13 @@ always @(posedge CLK) begin
           regs_dr[15:8] <= DI;
         end
       end else begin
+        // 8-bit mode: low byte only, high byte preserved. This matches
+        // bsnes and Mesen (`dr = (dr & 0xff00) | data`); the previous
+        // zero-extending form followed ares instead. It matters for
+        // ST011: the trace shows the firmware clearing DRC and running
+        // DRS-paced 16-bit transfers around words 233-239, then
+        // switching back, so the two modes interleave on live data and
+        // a silently cleared high byte is observable.
         regs_dr[7:0] <= DI;
       end
     end else if(ld_dst == 4'b0110 && insn_state == STATE_STORE) begin
@@ -497,37 +676,48 @@ always @(posedge CLK) begin
             flags_s0[op_asl] <= alu_r[15];
           end
           case(op_alu)
+            // OR, AND, XOR, NOT, SAR1, RCL1, SLL2, SLL4, XCHG: per nocash's
+            // documented table (verified against real silicon via no$sns),
+            // S1=sf UNCONDITIONALLY (not gated on old OV1 -- these ops
+            // never overflow, so S1 simply always tracks the new sign),
+            // OV1=0 and OV0=0 unconditionally. Cy=0 except SAR1/RCL1,
+            // which carry the shifted-out bit.
             4'b0001, 4'b0010, 4'b0011, 4'b1010, 4'b1101, 4'b1110, 4'b1111: begin
               flags_c[op_asl] <= 0;
               flags_ov0[op_asl] <= 0;
               flags_ov1[op_asl] <= 0;
+              flags_s1[op_asl] <= alu_r[15];
             end
-            4'b0100, 4'b0101, 4'b0110, 4'b0111, 4'b1000, 4'b1001: begin
-              if(op_alu[0]) begin
-                flags_c[op_asl] <= (alu_r < alu_q);
-                flags_ov0[op_asl] <= (alu_q[15] ^ alu_r[15]) & ~(alu_q[15] ^ alu_p[15]);
-                if((alu_q[15] ^ alu_r[15]) & ~(alu_q[15] ^ alu_p[15])) begin
-                  flags_s1[op_asl] <= flags_ov1[op_asl] ^ ~alu_r[15];
-                  flags_ov1[op_asl] <= ~flags_ov1[op_asl];
-                end
-              end else begin
-                flags_c[op_asl] <= (alu_r > alu_q);
-                flags_ov0[op_asl] <= (alu_q[15] ^ alu_r[15]) & (alu_q[15] ^ alu_p[15]);
-                if((alu_q[15] ^ alu_r[15]) & (alu_q[15] ^ alu_p[15])) begin
-                  flags_s1[op_asl] <= flags_ov1[op_asl] ^ ~alu_r[15];
-                  flags_ov1[op_asl] <= ~flags_ov1[op_asl];
-                end
-              end
-            end
-            4'b1011: begin
+            4'b1011: begin  // SAR1
               flags_c[op_asl] <= alu_q[0];
               flags_ov0[op_asl] <= 0;
               flags_ov1[op_asl] <= 0;
+              flags_s1[op_asl] <= alu_r[15];
             end
-            4'b1100: begin
+            4'b1100: begin  // RCL1
               flags_c[op_asl] <= alu_q[15];
               flags_ov0[op_asl] <= 0;
               flags_ov1[op_asl] <= 0;
+              flags_s1[op_asl] <= alu_r[15];
+            end
+            // SUB, ADD, SBB, ADC, DEC, INC: per nocash, "S1=sf and OV1=OV1
+            // XOR 1 upon overflow (leave S1 and OV1 both unchanged if no
+            // overflow)". A plain toggle on OV0, not a sign comparison --
+            // verified this produces the documented "skip if 0 or 2
+            // overflows occurred" parity behavior the JOVA1/JNOVA1 opcodes
+            // rely on (checked numerically before implementing this).
+            4'b0100, 4'b0101, 4'b0110, 4'b0111, 4'b1000, 4'b1001: begin
+              if(op_alu[0]) begin
+                flags_c[op_asl] <= (alu_r < alu_q);
+              end else begin
+                flags_c[op_asl] <= (alu_r > alu_q);
+              end
+              flags_ov0[op_asl] <= alu_ov0_arith;
+              if(alu_ov0_arith) begin
+                flags_s1[op_asl] <= alu_r[15];
+                flags_ov1[op_asl] <= ~flags_ov1[op_asl];
+              end
+              // else: s1 and ov1 both stay unchanged (no assignment)
             end
           endcase
         end
@@ -543,6 +733,7 @@ always @(posedge CLK) begin
         op_dst <= opcode_w[3:0];
         jp_brch <= opcode_w[21:13];
         jp_na <= opcode_w[12:2];
+        jp_bank <= opcode_w[1:0];
 
         ld_id <= opcode_w[21:6];
         ld_dst <= opcode_w[3:0];
@@ -561,11 +752,13 @@ always @(posedge CLK) begin
               4'b0011: idb <= regs_tr;
               4'b0100: idb <= {regs_dpb,regs_dph,regs_dpl};
               4'b0101: idb <= regs_rp;
-              4'b0110: idb <= dat_doutb; // Address: [regs_rp]
+              4'b0110: idb <= dat_doutb_fixed; // Address: [regs_rp]
               4'b0111: idb <= flags_s1[0] ? 16'h7fff : 16'h8000;
               4'b1000: idb <= regs_dr;
               4'b1001: idb <= regs_dr;
               4'b1010: idb <= regs_sr;
+              4'b1011: idb <= regs_si; // SI, MSB opcode variant
+              4'b1100: idb <= regs_si; // SI, LSB opcode variant
               4'b1101: idb <= regs_k;
               4'b1110: idb <= regs_l;
               4'b1111: idb <= ram_douta; // Address: [regs_dp]
@@ -574,7 +767,7 @@ always @(posedge CLK) begin
         endcase
       end
       STATE_ALU1: begin
-        insn_state <= STATE_ALU2;
+        insn_state <= SKIP_ALU2 ? STATE_STORE : STATE_ALU2;
         case(op)
           I_OP, I_RT: begin
             alu_q <= regs_ab[op_asl];
@@ -595,8 +788,11 @@ always @(posedge CLK) begin
           end
           I_JP: begin
             case(jp_brch)
-              9'b100_000_000: cond_true <= 1;
-              9'b101_000_000: cond_true <= 1;
+              9'b000_000_000: cond_true <= 1; // JMPSO, jump to SO register (opcode $000)
+              9'b100_000_000: cond_true <= 1; // JP,  page bit cleared (opcode $100)
+              9'b100_000_001: cond_true <= 1; // JP,  page bit set     (opcode $101)
+              9'b101_000_000: cond_true <= 1; // CALL, page bit cleared (opcode $140)
+              9'b101_000_001: cond_true <= 1; // CALL, page bit set     (opcode $141)
               9'b010_000_000: cond_true <= (flags_c[0] == 0);
               9'b010_000_010: cond_true <= (flags_c[0] == 1);
               9'b010_000_100: cond_true <= (flags_c[1] == 0);
@@ -668,7 +864,7 @@ always @(posedge CLK) begin
                 alu_store <= 2'b01;
               end
               4'b0011: regs_tr <= idb;
-              4'b0100: {regs_dpb,regs_dph,regs_dpl} <= idb[9:0];
+              4'b0100: {regs_dpb,regs_dph,regs_dpl} <= idb[10:0];
               4'b0101: regs_rp <= idb;
 //              4'b0110: regs_dr <= idb;
               4'b0111: begin
@@ -682,10 +878,12 @@ always @(posedge CLK) begin
                 regs_sr[1] <= idb[1];
                 regs_sr[0] <= idb[0];
               end
+              4'b1000, 4'b1001: regs_so <= idb; // SO (LSB/MSB opcode variants
+                                                 // both write the full value)
               4'b1010: regs_k <= idb;
               4'b1011: begin
                 regs_k <= idb;
-                regs_l <= dat_doutb;
+                regs_l <= dat_doutb_fixed;
               end
               4'b1100: begin
                 regs_k <= ram_douta;
@@ -701,7 +899,7 @@ always @(posedge CLK) begin
               4'b0001: regs_ab[0] <= ld_id;
               4'b0010: regs_ab[1] <= ld_id;
               4'b0011: regs_tr <= ld_id;
-              4'b0100: {regs_dpb,regs_dph,regs_dpl} <= ld_id[9:0];
+              4'b0100: {regs_dpb,regs_dph,regs_dpl} <= ld_id[10:0];
               4'b0101: regs_rp <= ld_id;
 //              4'b0110: regs_dr <= ld_id;
               4'b0111: begin
@@ -715,10 +913,11 @@ always @(posedge CLK) begin
                 regs_sr[1] <= ld_id[1];
                 regs_sr[0] <= ld_id[0];
               end
+              4'b1000, 4'b1001: regs_so <= ld_id;
               4'b1010: regs_k <= ld_id;
               4'b1011: begin
                 regs_k <= ld_id;
-                regs_l <= dat_doutb;
+                regs_l <= dat_doutb_fixed;
               end
               4'b1100: begin
                 regs_k <= ram_douta;
@@ -730,51 +929,69 @@ always @(posedge CLK) begin
             endcase
           end
         endcase
+        // pc itself now comes from the shared pc_next wire above (which
+        // the fetch unit has already seen this cycle); only the side
+        // effects stay here.
+        pc <= pc_next;
         case(op)
           I_OP, I_RT: begin
             if(op_rpdcr) regs_rp <= regs_rp - 1;
-            if(op == I_OP) pc <= pc + 1;
-            else begin
-              pc <= stack[regs_sp-1];
-              regs_sp <= regs_sp - 1;
-            end
+            if(op == I_RT) regs_sp <= regs_sp - 1;
           end
           I_JP: begin
-            if(cond_true) begin
-              pc <= jp_na;
-              if(jp_brch[8:6] == 3'b101) begin
-                stack[regs_sp] <= pc + 1;
-                regs_sp <= regs_sp + 1;
-              end
-            end else pc <= pc + 1;
-          end
-          I_LD: begin
-            pc <= pc + 1;
+            // CALL/LCALL (jp_brch $14x) push the return address.
+            if(cond_true && (jp_brch[8:6] == 3'b101)) begin
+              stack[regs_sp] <= pc + 1;
+              regs_sp <= regs_sp + 1;
+            end
           end
         endcase
         cpu_wait <= dsp_feat[3:0];
       end
 
       STATE_NEXT: begin
-        insn_state <= STATE_NEXT;
-        if(~|cpu_wait) insn_state <= STATE_IDLE1;
-        cpu_wait <= cpu_wait - 1;
+        if(~|cpu_wait) begin
+          // cpu_wait has already run out -- for DSP1-4 (ext_pgm_en=0) this
+          // is unconditional, exactly as before. For ST010/ST011, hold here
+          // (without further decrementing cpu_wait) until the external
+          // fetch for the new pc has completed; in practice this overlaps
+          // almost entirely with the cpu_wait cycles already being spent
+          // above to throttle the core down to its real clock speed, so it
+          // rarely costs anything extra.
+          if(~ext_pgm_en | ext_pgm_ready) insn_state <= STATE_IDLE1;
+        end else begin
+          insn_state <= STATE_NEXT;
+          cpu_wait <= cpu_wait - 1;
+        end
       end
 
       STATE_IDLE1: begin
-        insn_state <= STATE_FETCH;
-        case(op)
-          I_OP, I_RT: begin
-            case(op_dpl)
-              2'b01: regs_dpl <= regs_dpl + 1;
-              2'b10: regs_dpl <= regs_dpl - 1;
-              2'b11: regs_dpl <= 4'b0000;
-            endcase
-            regs_dph <= regs_dph ^ op_dphm;
-            if(|op_alu && alu_store[op_asl]) regs_ab[op_asl] <= alu_r;
-            alu_store <= 2'b11;
-          end
-        endcase
+        // Cold-start gate. Every instruction after the first reaches
+        // this state through STATE_NEXT, which already waited for the
+        // fetch -- but the entry into IDLE1 from reset does not. Without
+        // this the core runs one instruction's worth of whatever `dout`
+        // happens to hold before the first external fetch completes: all
+        // zeros on a configured FPGA, which decodes as an OP that
+        // advances pc, silently skipping word 0 of the firmware.
+        //
+        // Costs nothing in steady state (the condition is already true
+        // on arrival), and the whole body is inside the guard so the
+        // DP/accumulator writeback still happens exactly once.
+        if(~ext_pgm_en | ext_pgm_ready) begin
+          insn_state <= STATE_FETCH;
+          case(op)
+            I_OP, I_RT: begin
+              case(op_dpl)
+                2'b01: regs_dpl <= regs_dpl + 1;
+                2'b10: regs_dpl <= regs_dpl - 1;
+                2'b11: regs_dpl <= 4'b0000;
+              endcase
+              regs_dph <= regs_dph ^ op_dphm;
+              if(|op_alu && alu_store[op_asl]) regs_ab[op_asl] <= alu_r;
+              alu_store <= 2'b11;
+            end
+          endcase
+        end
       end
     endcase
   end else if(RST & ss_frozen) begin
@@ -783,11 +1000,11 @@ always @(posedge CLK) begin
     // everything else is here. Mirrors the read mux offset map exactly.
     if(ss_regwin & reg_we_rising) begin
       if(DP_ADDR[7:0] >= 8'h34 && DP_ADDR[7:0] <= 8'h53) begin
-        if(DP_ADDR[0]) stack[ss_stk_idx][10:8] <= DI[2:0];
+        if(DP_ADDR[0]) stack[ss_stk_idx][13:8] <= DI[5:0];
         else           stack[ss_stk_idx][7:0]  <= DI;
       end else case(DP_ADDR[7:0])
         8'h00: pc[7:0]          <= DI;
-        8'h01: pc[10:8]         <= DI[2:0];
+        8'h01: pc[13:8]         <= DI[5:0];
         8'h02: regs_ab[0][7:0]  <= DI;
         8'h03: regs_ab[0][15:8] <= DI;
         8'h04: regs_ab[1][7:0]  <= DI;
@@ -811,7 +1028,7 @@ always @(posedge CLK) begin
         8'h16: regs_n[7:0]      <= DI;
         8'h17: regs_n[15:8]     <= DI;
         8'h18: begin regs_dph <= DI[7:4]; regs_dpl <= DI[3:0]; end
-        8'h19: regs_dpb <= DI[1:0];
+        8'h19: regs_dpb <= DI[2:0];
         8'h1a: regs_sp  <= DI[3:0];
         8'h1b: insn_state <= DI;
         8'h1c: begin flags_s1[0] <= DI[5]; flags_s0[0] <= DI[4]; flags_c[0] <= DI[3];
@@ -835,16 +1052,20 @@ always @(posedge CLK) begin
         8'h2c: begin op_src <= DI[7:4]; op_dst <= DI[3:0]; end
         8'h2d: begin ld_dst <= DI[7:4]; alu_store <= DI[2:1]; cond_true <= DI[0]; end
         8'h2e: jp_brch[7:0] <= DI;
-        8'h2f: jp_brch[8]   <= DI[0];
+        8'h2f: begin jp_brch[8] <= DI[0]; jp_bank <= DI[6:5]; end
         8'h30: jp_na[7:0]   <= DI;
         8'h31: jp_na[10:8]  <= DI[2:0];
         8'h32: cpu_wait     <= DI[3:0];
+        8'h54: regs_so[7:0]  <= DI;
+        8'h55: regs_so[15:8] <= DI;
+        8'h56: regs_si[7:0]  <= DI;
+        8'h57: regs_si[15:8] <= DI;
         default: ; // $33 magic (read-only)
       endcase
     end
   end else begin
     insn_state <= STATE_IDLE1;
-    pc <= 11'b0;
+    pc <= 14'b0;
     regs_sp <= 4'b0000;
     cond_true <= 0;
     regs_sr[14] <= 0;
@@ -854,8 +1075,15 @@ always @(posedge CLK) begin
     regs_sr[9] <= 0;
     regs_sr[8] <= 0;
     regs_sr[7] <= 0;
-    regs_rp <= 16'h0000;
-    regs_dpb <= 2'b0;
+    regs_rp <= 11'h000; // matches ares's power(): regs.rp = 0x0000.
+                         // (nocash documents RP=3FFh for the base chip's
+                         // 10-bit RP; extrapolating that to this 11-bit
+                         // register was my own inference and is not
+                         // corroborated by the reference implementation
+                         // that actually runs these games, so it is not
+                         // used here. RP is loaded before use by the
+                         // dispatch code anyway.)
+    regs_dpb <= 3'b0;
     regs_dph <= 4'b0;
     regs_dpl <= 4'b0;
     regs_k <= 16'b0;
@@ -870,6 +1098,8 @@ always @(posedge CLK) begin
     flags_s1 <= 2'b0;
     regs_tr <= 16'b0;
     regs_trb <= 16'b0;
+    regs_so <= 16'b0;
+    regs_si <= 16'b0;
     op_pselect <= 2'b0;
     op_alu <= 4'b0;
     op_asl <= 1'b0;
@@ -880,6 +1110,7 @@ always @(posedge CLK) begin
     op_dst <= 4'b0;
     jp_brch <= 9'b0;
     jp_na <= 11'b0;
+    jp_bank <= 2'b0;
     ld_id <= 16'b0;
     ld_dst <= 4'b0;
     regs_m <= 16'b0;

@@ -129,6 +129,15 @@ msu_databuf snes_msu_databuf (
 `endif
 `endif
 `ifdef MK3
+/* Full 16384-word MSU-1 audio buffer, restored.
+   It was cut to 256 words to free 16 M9K blocks for the ST010/ST011
+   program cache when that cache was 8192 entries. The cache is now 4096
+   entries (12 blocks instead of 24), which leaves room for both: the
+   estimate is ~49 of 56 blocks with this buffer at full size. See the
+   CACHE_BITS note in upd77c25_extpgm.v for why halving the cache does not
+   cost ST011 anything -- its real-time path is four consecutive words,
+   which cannot conflict in a direct-mapped cache and sit inside the
+   prewarmed range. */
 msu_databuf snes_msu_databuf (
   .clock(clkin),
   .wren(~pgm_we), // Bus [0 : 0]

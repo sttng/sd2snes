@@ -137,9 +137,12 @@ wire [7:0] DSPX_SNES_DATA_IN;
 wire [7:0] DSPX_SNES_DATA_OUT;
 
 wire [23:0] dspx_pgm_data;
-wire [10:0] dspx_pgm_addr;
+wire [13:0] dspx_pgm_addr;
 wire dspx_pgm_we;
 
+wire dspx_vsum_start;
+wire dspx_vsum_busy;
+wire [31:0] dspx_vsum;
 wire [15:0] dspx_dat_data;
 wire [10:0] dspx_dat_addr;
 wire dspx_dat_we;
@@ -150,6 +153,7 @@ wire feat_cmd_unlock = featurebits[5];
 wire dspx_ss_halt;
 wire dspx_ss_halted;
 wire dspx_ss_window_en = featurebits[0]; // FEAT_DSPX: 1 = DSP1-4 (scan overlay), 0 = ST0010
+wire dspx_ext_pgm_en = featurebits[1]; // FEAT_ST0010: fetch program from external Bus 2 SRAM
 
 wire r213f_enable;
 
@@ -372,23 +376,28 @@ always @(posedge CLK2) begin
 
 end
 
-parameter ST_IDLE        = 11'b00000000001;
-parameter ST_MCU_RD_ADDR = 11'b00000000010;
-parameter ST_MCU_RD_END  = 11'b00000000100;
-parameter ST_MCU_WR_ADDR = 11'b00000001000;
-parameter ST_MCU_WR_END  = 11'b00000010000;
-parameter ST_CTX_WR_ADDR = 11'b00000100000;
-parameter ST_CTX_WR_END  = 11'b00001000000;
-parameter ST_DMA_RD_ADDR = 11'b00010000000;
-parameter ST_DMA_RD_END  = 11'b00100000000;
-parameter ST_DMA_WR_ADDR = 11'b01000000000;
-parameter ST_DMA_WR_END  = 11'b10000000000;
+parameter ST_IDLE        = 13'b0000000000001;
+parameter ST_MCU_RD_ADDR = 13'b0000000000010;
+parameter ST_MCU_RD_END  = 13'b0000000000100;
+parameter ST_MCU_WR_ADDR = 13'b0000000001000;
+parameter ST_MCU_WR_END  = 13'b0000000010000;
+parameter ST_CTX_WR_ADDR = 13'b0000000100000;
+parameter ST_CTX_WR_END  = 13'b0000001000000;
+parameter ST_DMA_RD_ADDR = 13'b0000010000000;
+parameter ST_DMA_RD_END  = 13'b0000100000000;
+parameter ST_DMA_WR_ADDR = 13'b0001000000000;
+parameter ST_DMA_WR_END  = 13'b0010000000000;
+// DSP program fetch from PSRAM (ST010/ST011). Lowest priority of all
+// requesters and gated by free_slot like the rest, so the SNES is never
+// delayed by a DSP fetch.
+parameter ST_DSP_RD_ADDR = 13'b0100000000000;
+parameter ST_DSP_RD_END  = 13'b1000000000000;
 
 parameter SNES_DEAD_TIMEOUT = 17'd96000; // 1ms
 
 parameter ROM_CYCLE_LEN = 4'd7;
 
-reg [10:0] STATE;
+reg [12:0] STATE; // widened for the DSP fetch states above
 initial STATE = ST_IDLE;
 
 assign DSPX_SNES_DATA_IN = BUS_DATA;
@@ -562,15 +571,27 @@ upd77c25 snes_dspx (
   .PGM_WR(dspx_pgm_we),
   .PGM_DI(dspx_pgm_data),
   .PGM_WR_ADDR(dspx_pgm_addr),
+  .psram_rrq(DSP_RRQ_w),
+  .psram_addr(DSP_ROM_ADDR_w),
+  .psram_din(DSP_DINr),
+  .psram_rdy(RQ_DSP_RDYr),
+  .vsum_start(dspx_vsum_start),
+  .vsum_busy(dspx_vsum_busy),
+  .vsum(dspx_vsum),
   .DAT_WR(dspx_dat_we),
   .DAT_DI(dspx_dat_data),
   .DAT_WR_ADDR(dspx_dat_addr),
   .DP_enable(dspx_dp_enable),
-  .DP_ADDR(SNES_ADDR[10:0]),
+  .DP_ADDR(SNES_ADDR[11:0]),
   .ss_halt(dspx_ss_halt),
   .ss_window_en(dspx_ss_window_en),
   .ss_halted(dspx_ss_halted),
-  .dsp_feat(dsp_feat)
+  .dsp_feat(dsp_feat),
+  .ext_pgm_en(dspx_ext_pgm_en),
+  .RAM_ADDR(RAM_ADDR),
+  .RAM_DATA(RAM_DATA),
+  .RAM_OE(RAM_OE),
+  .RAM_WE(RAM_WE)
 );
 `endif
 
@@ -636,6 +657,9 @@ mcu_cmd snes_mcu_cmd(
   .dspx_pgm_data_out(dspx_pgm_data),
   .dspx_pgm_addr_out(dspx_pgm_addr),
   .dspx_pgm_we_out(dspx_pgm_we),
+  .dspx_vsum_start(dspx_vsum_start),
+  .dspx_vsum_busy(dspx_vsum_busy),
+  .dspx_vsum(dspx_vsum),
   .dspx_dat_data_out(dspx_dat_data),
   .dspx_dat_addr_out(dspx_dat_addr),
   .dspx_dat_we_out(dspx_dat_we),
@@ -898,6 +922,19 @@ assign CTX_RDY = RQ_CTX_RDYr;
 reg RQ_DMA_RDYr;
 initial RQ_DMA_RDYr = 1'b1;
 assign DMA_RDY = RQ_DMA_RDYr;
+// DSP program fetch
+reg RQ_DSP_RDYr;
+initial RQ_DSP_RDYr = 1'b1;
+reg DSP_RD_PENDr = 0;
+reg [23:0] DSP_ROM_ADDRr;
+reg [15:0] DSP_DINr;
+wire DSP_RRQ_w;
+wire [23:0] DSP_ROM_ADDR_w;
+assign DSP_RRQ = DSP_RRQ_w;
+assign DSP_ROM_ADDR = DSP_ROM_ADDR_w;
+wire DSP_RRQ;
+wire [23:0] DSP_ROM_ADDR;
+wire DSP_RD_HIT = |(STATE & (ST_DSP_RD_ADDR | ST_DSP_RD_END));
 
 wire MCU_WE_HIT = |(STATE & ST_MCU_WR_ADDR);
 wire MCU_WR_HIT = |(STATE & (ST_MCU_WR_ADDR | ST_MCU_WR_END));
@@ -923,9 +960,9 @@ my_dcm snes_dcm(
   .RST(DCM_RST)
 );
 
-assign ROM_ADDR  = (SD_DMA_TO_ROM) ? MCU_ADDR[23:1] : CTX_HIT ? CTX_ROM_ADDRr[23:1] : DMA_HIT ? DMA_ROM_ADDRr[23:1] : MCU_HIT ? ROM_ADDRr[23:1] : MAPPED_SNES_ADDR[23:1];
-assign ROM_ADDR0 = (SD_DMA_TO_ROM) ? MCU_ADDR[0]    : CTX_HIT ? CTX_ROM_ADDRr[0]    : DMA_HIT ? DMA_ROM_ADDRr[0]    : MCU_HIT ? ROM_ADDRr[0]    : MAPPED_SNES_ADDR[0];
-//always @(posedge CLK2) ROM_ADDR_PRE <= (SD_DMA_TO_ROM) ? MCU_ADDR[23:1] : CTX_HIT ? CTX_ROM_ADDRr[23:1] : DMA_HIT ? DMA_ROM_ADDRr[23:1] : MCU_HIT ? ROM_ADDRr[23:1] : MAPPED_SNES_ADDR[23:1];
+assign ROM_ADDR  = (SD_DMA_TO_ROM) ? MCU_ADDR[23:1] : CTX_HIT ? CTX_ROM_ADDRr[23:1] : DMA_HIT ? DMA_ROM_ADDRr[23:1] : MCU_HIT ? ROM_ADDRr[23:1] : DSP_RD_HIT ? DSP_ROM_ADDRr[23:1] : MAPPED_SNES_ADDR[23:1];
+assign ROM_ADDR0 = (SD_DMA_TO_ROM) ? MCU_ADDR[0]    : CTX_HIT ? CTX_ROM_ADDRr[0]    : DMA_HIT ? DMA_ROM_ADDRr[0]    : MCU_HIT ? ROM_ADDRr[0]    : DSP_RD_HIT ? DSP_ROM_ADDRr[0]    : MAPPED_SNES_ADDR[0];
+//always @(posedge CLK2) ROM_ADDR_PRE <= (SD_DMA_TO_ROM) ? MCU_ADDR[23:1] : CTX_HIT ? CTX_ROM_ADDRr[23:1] : DMA_HIT ? DMA_ROM_ADDRr[23:1] : MCU_HIT ? ROM_ADDRr[23:1] : DSP_RD_HIT ? DSP_ROM_ADDRr[23:1] : MAPPED_SNES_ADDR[23:1];
 //always @(posedge CLK2) ROM_ADDR0_PRE <= (SD_DMA_TO_ROM) ? MCU_ADDR[0] : CTX_HIT ? CTX_ROM_ADDRr[0] : DMA_HIT ? DMA_ROM_ADDRr[0] : MCU_HIT ? ROM_ADDRr[0] : MAPPED_SNES_ADDR[0];
 
 assign ROM_CE = 1'b0;
@@ -956,9 +993,9 @@ pll snes_pll(
 );
 
 wire ROM_ADDR22;
-assign ROM_ADDR22 = (SD_DMA_TO_ROM) ? MCU_ADDR[1]    : CTX_HIT ? CTX_ROM_ADDRr[1]    : DMA_HIT ? DMA_ROM_ADDRr[1]    : MCU_HIT ? ROM_ADDRr[1]    : MAPPED_SNES_ADDR[1];
-assign ROM_ADDR   = (SD_DMA_TO_ROM) ? MCU_ADDR[23:2] : CTX_HIT ? CTX_ROM_ADDRr[23:2] : DMA_HIT ? DMA_ROM_ADDRr[23:2] : MCU_HIT ? ROM_ADDRr[23:2] : MAPPED_SNES_ADDR[23:2];
-assign ROM_ADDR0  = (SD_DMA_TO_ROM) ? MCU_ADDR[0]    : CTX_HIT ? CTX_ROM_ADDRr[0]    : DMA_HIT ? DMA_ROM_ADDRr[0]    : MCU_HIT ? ROM_ADDRr[0]    : MAPPED_SNES_ADDR[0];
+assign ROM_ADDR22 = (SD_DMA_TO_ROM) ? MCU_ADDR[1]    : CTX_HIT ? CTX_ROM_ADDRr[1]    : DMA_HIT ? DMA_ROM_ADDRr[1]    : MCU_HIT ? ROM_ADDRr[1]    : DSP_RD_HIT ? DSP_ROM_ADDRr[1]    : MAPPED_SNES_ADDR[1];
+assign ROM_ADDR   = (SD_DMA_TO_ROM) ? MCU_ADDR[23:2] : CTX_HIT ? CTX_ROM_ADDRr[23:2] : DMA_HIT ? DMA_ROM_ADDRr[23:2] : MCU_HIT ? ROM_ADDRr[23:2] : DSP_RD_HIT ? DSP_ROM_ADDRr[23:2] : MAPPED_SNES_ADDR[23:2];
+assign ROM_ADDR0  = (SD_DMA_TO_ROM) ? MCU_ADDR[0]    : CTX_HIT ? CTX_ROM_ADDRr[0]    : DMA_HIT ? DMA_ROM_ADDRr[0]    : MCU_HIT ? ROM_ADDRr[0]    : DSP_RD_HIT ? DSP_ROM_ADDRr[0]    : MAPPED_SNES_ADDR[0];
 
 
 assign ROM_ZZ = 1'b1;
@@ -1013,6 +1050,20 @@ always @(posedge CLK2) begin
     MCU_RD_PENDr <= 1'b0;
     MCU_WR_PENDr <= 1'b0;
     RQ_MCU_RDYr <= 1'b1;
+  end
+end
+
+// DSP program fetch request (ST010/ST011 -- see ST_DSP_RD_* above).
+// Mirrors the MCU/DMA handshake exactly: assert PEND on request, clear
+// it and raise RDY when the arbiter reaches the END state.
+always @(posedge CLK2) begin
+  if(DSP_RRQ) begin
+    DSP_RD_PENDr <= 1'b1;
+    RQ_DSP_RDYr <= 1'b0;
+    DSP_ROM_ADDRr <= DSP_ROM_ADDR;
+  end else if(STATE & ST_DSP_RD_END) begin
+    DSP_RD_PENDr <= 1'b0;
+    RQ_DSP_RDYr <= 1'b1;
   end
 end
 
@@ -1083,7 +1134,23 @@ always @(posedge CLK2) begin
           STATE <= ST_DMA_WR_ADDR;
           ST_MEM_DELAYr <= ROM_CYCLE_LEN;
         end
+        // DSP fetch is granted LAST: every other requester, and the SNES
+        // itself (via free_slot), takes precedence. A DSP fetch can never
+        // delay the console.
+        else if(DSP_RD_PENDr) begin
+          STATE <= ST_DSP_RD_ADDR;
+          ST_MEM_DELAYr <= ROM_CYCLE_LEN;
+        end
       end
+    end
+    ST_DSP_RD_ADDR: begin
+      STATE <= ST_DSP_RD_ADDR;
+      ST_MEM_DELAYr <= ST_MEM_DELAYr - 1;
+      if(ST_MEM_DELAYr == 0) STATE <= ST_DSP_RD_END;
+      DSP_DINr <= ROM_DATA;   // full 16 bits: two reads cover a 24-bit word
+    end
+    ST_DSP_RD_END: begin
+      STATE <= ST_IDLE;
     end
     ST_MCU_RD_ADDR: begin
       STATE <= ST_MCU_RD_ADDR;

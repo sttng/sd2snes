@@ -47,8 +47,8 @@ module msu_databuf (
 
 	input	  clock;
 	input	[7:0]  data;
-	input	[13:0]  rdaddress;
-	input	[13:0]  wraddress;
+	input	[7:0]  rdaddress;
+	input	[7:0]  wraddress;
 	input	  wren;
 	output	[7:0]  q;
 `ifndef ALTERA_RESERVED_QIS
@@ -95,15 +95,15 @@ module msu_databuf (
 		altsyncram_component.clock_enable_output_b = "BYPASS",
 		altsyncram_component.intended_device_family = "Cyclone IV E",
 		altsyncram_component.lpm_type = "altsyncram",
-		altsyncram_component.numwords_a = 16384,
-		altsyncram_component.numwords_b = 16384,
+		altsyncram_component.numwords_a = 256,
+		altsyncram_component.numwords_b = 256,
 		altsyncram_component.operation_mode = "DUAL_PORT",
 		altsyncram_component.outdata_aclr_b = "NONE",
 		altsyncram_component.outdata_reg_b = "CLOCK0",
 		altsyncram_component.power_up_uninitialized = "FALSE",
 		altsyncram_component.read_during_write_mode_mixed_ports = "DONT_CARE",
-		altsyncram_component.widthad_a = 14,
-		altsyncram_component.widthad_b = 14,
+		altsyncram_component.widthad_a = 8,
+		altsyncram_component.widthad_b = 8,
 		altsyncram_component.width_a = 8,
 		altsyncram_component.width_b = 8,
 		altsyncram_component.width_byteena_a = 1;
