@@ -8,7 +8,7 @@
 // asked whether it did so FAST ENOUGH, and that turns out to be the whole
 // problem.
 //
-// The MesenCE reference trace (mesen_trace/) shows the host accessing the
+// The SNES Emulator reference trace shows the host accessing the
 // DSP's data register on a rigid schedule: 309 of 399 gaps are exactly 8
 // DSP instructions, 73 are 9, and not one is ever shorter. A fixed cadence
 // with no dependence on what the DSP is doing means DMA -- the SNES cannot

@@ -368,7 +368,7 @@ module upd77c25_extpgm (
   // and it was paid on hits -- the common case -- not just on misses.
   //
   // ST011 has no slack for that. Its host protocol is DMA-paced with no
-  // handshake: the MesenCE trace shows a host access to DR every 8 DSP
+  // handshake: the SNEES Emulator trace shows a host access to DR every 8 DSP
   // instructions, never fewer, while the DSP's transfer loop is 4
   // instructions long. Miss that budget and DR is overwritten before the
   // DSP consumes it, the loop counter never reaches zero, and the DSP
@@ -420,7 +420,7 @@ module upd77c25_extpgm (
   // overhead, about 30 cycles, roughly one entire host DMA byte slot.
   //
   // That alone is enough to break ST011. Its inbound transfer loop
-  // (words 197-200 in the MesenCE trace) is entered with 199 and 200
+  // (words 197-200 in the SNES Emulator trace) is entered with 199 and 200
   // uncached; the two cold fetches push the DSP's consumption of the
   // second byte past the arrival of the third, one byte is lost, the
   // loop counter never reaches zero, and the DSP hangs. This is why

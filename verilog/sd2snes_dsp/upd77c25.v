@@ -182,7 +182,7 @@ wire ext_pgm_busy_wr;
 // ---- THROUGHPUT (ST011) ------------------------------------------------
 //
 // ST011 talks to the SNES entirely through DR/SR, and it does so on a
-// DMA-paced schedule with no handshake. The MesenCE reference trace shows
+// DMA-paced schedule with no handshake. The SNES Emulator reference trace shows
 // a host access to DR every 8 DSP instructions -- 309 of 399 gaps are
 // exactly 8, and none is ever less -- while the DSP's transfer loops
 // (words 197-200 in, 243-246 out) are 4 instructions long. So the core
@@ -638,7 +638,7 @@ always @(posedge CLK) begin
         end
       end else begin
         // 8-bit mode: low byte only, high byte preserved. This matches
-        // bsnes and Mesen (`dr = (dr & 0xff00) | data`); the previous
+        // bsnes & Ares (`dr = (dr & 0xff00) | data`); the previous
         // zero-extending form followed ares instead. It matters for
         // ST011: the trace shows the firmware clearing DRC and running
         // DRS-paced 16-bit transfers around words 233-239, then

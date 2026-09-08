@@ -251,8 +251,7 @@ assign dspx_enable =
     :1'b0)
   :featurebits[FEAT_ST0010]
   // ST010/ST011: DR at $60:0000, SR at $60:0001, mirrored at $E0.
-  // Window is $0000-$0FFF, matching the hardware decode (and Mesen's
-  // 0x60,0x0000-0x0FFF handler) -- NOT the full $0000-$7FFF this used
+  // Window is $0000-$0FFF, matching the hardware decode -- NOT the full $0000-$7FFF this used
   // to accept. Reads and writes here have side effects (a DR access
   // clears RQM), so an 8x-too-wide window means any stray access
   // anywhere in 32KB silently advances the handshake.
