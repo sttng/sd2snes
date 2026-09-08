@@ -547,7 +547,7 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
      whole range sat below the rate ST011 needs.
 
      ST011 needs that rate.  Its host protocol is DMA-paced with no
-     handshake -- the MesenCE trace shows a host access to DR every 8 DSP
+     handshake -- the SNES Emulator trace shows a host access to DR every 8 DSP
      instructions, never fewer, against a 4-instruction transfer loop.
      Run slower than that and DR is overwritten before the DSP consumes
      it, the loop counter never reaches zero, and the DSP hangs in JRQM.
