@@ -21,7 +21,10 @@ core would load the wrong image at the wrong size.
 Derived from `sd2snes_dsp` with the working ST011 fixes, minus two things
 that this cart type never uses.
 
-## What was removed, and why it matters
+## What was removed
+
+
+### MSU-1 audio DAC removed
 
 **MSU-1.** 8 BRAM on mk2, 16 M9K on mk3. No ST011 cart uses it.
 `msu.v` and `msu_databuf` are gone; the `msu_*` nets, `address.v`'s
@@ -30,37 +33,21 @@ in place — they are shared modules, the MCU never sets `FEAT_MSU1` here,
 and synthesis prunes the unreachable logic. The three signals the module
 used to drive are tied off in `main.v`.
 
-**`upd77c25_pgmrom` was removed and then put back.** The reasoning for
-removing it was that this core fetches its 16384-word program externally
-and never reads the on-chip 2048-word ROM. True once `ext_pgm_en` is high
--- but with the ROM gone there is no opcode source at all while that bit
-is low, which includes the window between FPGA configuration and the MCU's
-feature write. It is back, and `opcode_w` is the original
-`ext_pgm_en ? ext_pgm_dout : pgm_doutb` mux again.
+`dac.v` and `dac_buf` are gone from both mk2 and mk3. The buffer's only
+source is MSU-1 audio, which this core does not have, so it was dead weight:
+1 BRAM on mk2, 2 M9K on mk3. On mk2 that is the difference between 16 of 16
+and 15 of 16.
 
-Dropping MSU-1 alone is enough to fit the mk2.
+`DAC_MCLK`, `DAC_LRCK` and `DAC_SDOUT` are driven to a defined idle in
+`main.v` rather than left floating, so the external DAC sees a static silent
+input instead of an undriven bus. `DAC_STATUS` -- one bit, per mcu_cmd.v's
+port -- is tied low; it used to be driven by the dac module.
 
-## mk2 budget (XC3S400 — 16 RAMB16 of 18 Kbit)
+`mcu_cmd.v`'s DAC registers are deliberately left in place. It is a shared
+module, the MCU never drives audio on this core, and synthesis prunes the
+unreachable logic. Only the module and its buffer are removed.
 
-```
-cache_data_lo    4096 x 18    4
-cache_data_hi    4096 x  9    2
-upd77c25_datram  2048 x 16    2
-upd77c25_datrom  2048 x 16    2
-upd77c25_pgmrom  2048 x 24    3
-dac_buf          2048 x  8    1
-snescmd_buf      1024 x  8    1
-                             15 of 16
-```
-
-One spare -- tight. `dac_buf` is the next candidate if more is needed (see
-below); removing it would give three. Note this only works at `CACHE_BITS = 12`: at 8192 entries the
-cache alone is 12 BRAM and the total is 18, over the device. mk3 comes to
-roughly 29 of 56.
-
-`dac_buf` is a further 1 BRAM that is also dead without MSU-1 audio —
-removing `dac.v` is available if the margin is ever needed, but it touches
-pin wiring in `main.v`, so it is left in.
+mk3 total is now roughly 21 of 56.
 
 ## Before you build
 
@@ -77,15 +64,7 @@ byte-wide window and wants 4096 x 8.
 plain text and were updated in the working build.
 
 The design elaborates clean on mk3 under Icarus, and the ST011 rate test
-still reports 6.01 cycles/instruction with 64/64 bytes consumed. mk2 has
-not been elaborated because the vendor IP wrappers are stale as described
-above; that is the first thing to resolve.
-
-## Simulation
-
-`sim/` holds `extpgm_tb.v`, `st011_rate_tb.v`, `miss_latency_tb.v` and
-`ip_stubs.v` (behavioural memories — simulation only, do not add to the
-project). See `docs/STATUS.md` in the working package for what each proves.
+still reports 6.01 cycles/instruction with 64/64 bytes consumed.
 
 ## Configuration
 
@@ -156,46 +135,6 @@ coverage the ST011 transfer loops depend on.
 Note this only fits because MSU-1 is absent (8 BRAM). It will not fold back
 into `sd2snes_dsp`.
 
-
-## MSU-1 audio DAC removed
-
-`dac.v` and `dac_buf` are gone from both mk2 and mk3. The buffer's only
-source is MSU-1 audio, which this core does not have, so it was dead weight:
-1 BRAM on mk2, 2 M9K on mk3. On mk2 that is the difference between 16 of 16
-and 15 of 16.
-
-`DAC_MCLK`, `DAC_LRCK` and `DAC_SDOUT` are driven to a defined idle in
-`main.v` rather than left floating, so the external DAC sees a static silent
-input instead of an undriven bus. `DAC_STATUS` -- one bit, per mcu_cmd.v's
-port -- is tied low; it used to be driven by the dac module.
-
-`mcu_cmd.v`'s DAC registers are deliberately left in place. It is a shared
-module, the MCU never drives audio on this core, and synthesis prunes the
-unreachable logic. Only the module and its buffer are removed.
-
-mk3 total is now roughly 21 of 56.
-
-
-## On-chip program ROM removed
-
-`upd77c25_pgmrom` is gone from both targets: 4 RAMB16 on mk2, 6 M9K on mk3.
-It holds 2048 words for DSP1-4; this core's program is 16384 words and always
-arrives through the external fetch path, so it was never read.
-
-This was removed once before and put back, on the theory that it left no
-opcode source while `ext_pgm_en` is low. That turned out to be wrong -- the
-failure at the time was a firmware endianness mix-up, and the window does not
-exist: `mcu_cmd.v` powers up with `dspx_reset_out = 1`, `main.v` wires
-`.RST(~dspx_reset)`, and the MCU only releases reset after the feature write
-and the firmware load.
-
-Because that safety depends on reset ORDERING rather than on anything local,
-the cold-start gates in `upd77c25.v` were tightened at the same time. They
-now require `ext_pgm_en & ext_pgm_ready` instead of treating "external fetch
-disabled" as "ready to run". If the reset ordering is ever changed, the core
-stalls at pc=0 rather than executing whatever `ext_pgm_dout` happens to hold.
-Verified in simulation: with `ext_pgm_en` tied low and the core out of reset,
-pc stays at 0 for 2000 clocks.
 
 ## Call stack reduced to 8 entries
 
@@ -296,17 +235,6 @@ picks these up automatically -- common.mk derives XILINX_MAP_OPTS from the
 
 `chipscope_icon` and `chipscope_ila` are only instantiated under
 `` `ifdef MK2_DEBUG `` -- on-chip debug logic, not part of a normal build.
-Their `.ngc` netlists were never generated because nothing needs them, but
-the `.xise` still listed both `.xco` files as project sources, so ISE tried
-to resolve the netlists at every process that walks the source list:
-
-```
-WARNING:ProjectMgmt - File .../ip/mk2/chipscope_ila.ngc is missing.
-```
-
-Harmless, but repeated dozens of times and it buries real warnings. Both
-cores are now out of the `.xise`. The files are still in `ip/mk2/`, so a
-MK2_DEBUG build just needs them added back as CoreGen sources and generated.
 
 ## Timing: stack top registered
 
