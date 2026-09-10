@@ -57,6 +57,10 @@
 #define FEAT_PF94          (1 << 15)  /* PowerFest '94 event board (dsp core) */
 #define FEAT_CC92          (1 << 14)  /* Campus Challenge '92 event board (dsp core) */
 #define FEAT_COMBO         (1 << 13)  /* dead: set by smc.c, never read by any FPGA core */
+/* NOTE: bits 14 and 15 are NOT free. address.v defines FEAT_CC92 = 14 and
+   FEAT_PF94 = 15 (the event-board decodes) and this header does not list
+   them. Setting either from here remaps ROM/SaveRAM. Every bit 0-15 is
+   allocated; there is no room for a new feature without reclaiming one. */
 #define FEAT_BUSCOMPAT     (1 << 13)  /* reuses the dead COMBO bit; forced from CFG.bus_compat in fpga_set_features (global bus-timing compat, not per-ROM). main.v muxes SNES_PULSE_end/READ_narrow on it */
 #define FEAT_SATELLABASE   (1 << 12)
 #define FEAT_DMA1          (1 << 11)

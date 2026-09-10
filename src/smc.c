@@ -338,16 +338,26 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
       /* ST0011 LoROM */
       else if (header->map == 0x30 && header->carttype == 0xf6 && header->romsize < 0xa) {
         props->has_dspx = 1;
+        /* uPD96050 family: identical FPGA-side bus decode, external-fetch
+           path, SaveRAM sizing and savestate limitations as ST0010 (see
+           savestate.c's dsp_ok check, which gates on has_st0010) -- only
+           the firmware filename and the core differ.
+           FEAT_ST0010 is the "uPD96050 present" bit and ST011 sets it too;
+           the ST010/ST011 split is by CORE (fpga_dsp vs fpga_st0011), not
+           by featurebit. There is no free bit to split them with -- see
+           the note in fpga_spi.h. ST010 keeps fpga_dsp and is untouched. */
         props->has_st0011 = 1;
         props->dsp_fw = DSPFW_ST0011;
-        props->fpga_conf = FPGA_DSP;
-       // props->fpga_features |= FEAT_ST0011;
-        props->error = MENU_ERR_NOIMPL;
-        props->error_param = (uint8_t*)"ST0011";
+        props->fpga_conf = FPGA_ST0011;
+        props->fpga_features |= FEAT_ST0010;
+        header->ramsize = 2;
       }
       /* ST0018 LoROM */
       else if (header->map == 0x30 && header->carttype == 0xf5) {
-        props->has_st0011 = 1;
+        /* ST0018 is an ARM core, unrelated to the uPD96050 -- it must not
+           set has_st0011. That was harmless while ST0011 itself was
+           refused; now that has_st0011 selects a core and a firmware
+           image, it would be a live mis-identification. */
         props->error = MENU_ERR_NOIMPL;
         props->error_param = (uint8_t*)"ST0018";
       }
@@ -528,7 +538,10 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
 
   /* ~12.5MHz for ST0010, 8MHz for DSPx */
   if(props->has_dspx) {
-    if(props->has_st0010) {
+    if(props->has_st0010 || props->has_st0011) {
+      /* uPD96050 family. Both want zero extra waitstates -- ST011's host
+         protocol is DMA-paced with no handshake and the core is already
+         slower than the real chip, so throttling it only loses bytes. */
       props->fpga_dspfeat = 0;
     } else {
       props->fpga_dspfeat = 4; /* 4 extra waitstates */

@@ -2116,7 +2116,11 @@ void sram_memset(uint32_t base_addr, uint32_t len, uint8_t val) {
   FPGA_DESELECT();
 }
 
-void load_dspx(const uint8_t *filename, uint8_t coretype) {
+void load_dspx(const uint8_t *filename, uint16_t coretype) {
+  /* coretype is uint16_t, NOT uint8_t: fpga_features is 16 bits and
+     FEAT_ST0011 is bit 14. Narrowing it here silently passed 0 and hit the
+     "unknown core" path, loading no firmware at all. FEAT_ST0010 (bit 1)
+     and FEAT_DSPX (bit 0) fit in 8 bits, which is why this went unnoticed. */
   UINT bytes_read;
   uint16_t word_cnt;
   uint8_t wordsize_cnt = 0;
@@ -2127,7 +2131,14 @@ void load_dspx(const uint8_t *filename, uint8_t coretype) {
   uint32_t pgmdata = 0;
   uint16_t datdata = 0;
 
-  if(coretype & FEAT_ST0010) {
+  if(romprops.has_st0011) {
+    /* ST011: uPD96050 geometry -- 16384 words of 24-bit program (48KB)
+       and 2048 words of 16-bit data ROM (4KB). Keyed on has_st0011
+       rather than a featurebit because ST010 and ST011 share
+       FEAT_ST0010; they are told apart by core, not by bit. */
+    datsize = 2048;
+    pgmsize = 16384;
+  } else if (coretype & FEAT_ST0010) {
     datsize = 1536;
     pgmsize = 2048;
   } else if (coretype & FEAT_DSPX) {
