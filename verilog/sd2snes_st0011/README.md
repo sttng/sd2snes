@@ -25,11 +25,10 @@ and ST011 firmware images are distributed in different byte orders (see
 `PGM_BYTE_SWAP` in `upd77c25_extpgm.v`). Pointing an ST010 cart at this
 core would load the wrong image at the wrong size.
 
-Derived from `sd2snes_dsp` with the working ST011 fixes, minus two things
+Derived from `sd2snes_dsp` with the working ST011 fixes, minus things
 that this cart type never uses.
 
 ## What was removed
-
 
 ### MSU-1 audio DAC removed
 
@@ -100,7 +99,6 @@ uPD77C25, not the uPD96050:
                     was            now
 upd77c25_datram     1024 x 16      2048 x 16  (port B 4096 x 8)
 upd77c25_datrom     1536 x 16      2048 x 16
-upd77c25_pgmrom     2048 x 24      2048 x 24  (unchanged)
 ```
 
 **The `.ngc` netlists are not shipped; they are generated from the `.xco`.**
@@ -135,18 +133,10 @@ snescmd_buf      1024 x  8    1
                              11 of 16
 ```
 
-Five spare. `dac_buf` and `upd77c25_pgmrom` have both been removed (see
-below). `CACHE_BITS` cannot go below 12 without giving up the prewarm
-coverage the ST011 transfer loops depend on.
-
-Note this only fits because MSU-1 is absent (8 BRAM). It will not fold back
-into `sd2snes_dsp`.
-
-
 ## Call stack reduced to 8 entries
 
 `stack` was 16 entries with a 4-bit `regs_sp`. The uPD96050's call stack is
-8 deep; 16 was arbitrary on my part and cost a 16-entry x 14-bit mux on
+8 deep; 16 was arbitrary and cost a 16-entry x 14-bit mux on
 every read -- `pc_next` selects from it combinationally for RT, and
 `regs_sp<0>` was the endpoint of the worst-failing CLK21 path on the mk2
 XC3S400 (-9.855 ns against a 10.412 ns budget).
