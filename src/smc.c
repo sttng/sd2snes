@@ -355,11 +355,17 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
       /* ST0018 LoROM */
       else if (header->map == 0x30 && header->carttype == 0xf5) {
         /* ST0018 is an ARM core, unrelated to the uPD96050 -- it must not
-           set has_st0011. That was harmless while ST0011 itself was
-           refused; now that has_st0011 selects a core and a firmware
-           image, it would be a live mis-identification. */
-        props->error = MENU_ERR_NOIMPL;
-        props->error_param = (uint8_t*)"ST0018";
+           set has_st0011 or has_dspx (those select the uPD96050 core and
+           its word-oriented firmware loader). It gets its own core,
+           fpga_st0018, which carries an ARMv3 CPU and runs the 160 KB
+           st018.rom out of the Bus 2 SRAM (loaded by load_st018()).
+           No featurebit: the core alone identifies the chip -- all 16
+           bits are allocated (see fpga_spi.h), the same reason ST010 and
+           ST011 are told apart by core. Savestates stay off automatically:
+           FPGA_ST0018 is not in savestate.c's core_has_snapshot list. */
+        props->has_st0018 = 1;
+        props->dsp_fw = DSPFW_ST0018;
+        props->fpga_conf = FPGA_ST0018;
       }
       /* OBC1 LoROM */
       else if (header->map == 0x30 && header->carttype == 0x25) {

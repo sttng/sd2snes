@@ -74,6 +74,7 @@ extern uint8_t fpga_boot_led;
    Dropping both is what makes it fit, so it cannot be folded back into
    fpga_dsp. Exists for both mk2 (.bit) and mk3 (.bi3). */
 #define FPGA_ST0011 ((const uint8_t*)"/sd2snes/fpga_st0011." FPGA_CONF_EXT)
+#define FPGA_ST0018 ((const uint8_t*)"/sd2snes/fpga_st0018." FPGA_CONF_EXT)
 /* mk2: boot-display bootstrap config ("fpga_mini"), loaded from SD instead of
    baked into the firmware to reclaim ~21 KB of the tight 128 KB flash. See
    fpga_rompgm(). mk3/mk3-stm32 keep it embedded (cfgware). */
