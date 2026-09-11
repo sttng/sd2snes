@@ -3,8 +3,7 @@
 uPD96050 core for **ST011 only** (Hayazashi Nidan Morita Shougi 2).
 Targets **mk2 (Spartan-3 XC3S400)** and **mk3 (Cyclone IV EP4CE15)**.
 
-Needs 
-
+Needs **st011.rom**
 
 | SHA256 Hash     | MD5 Hash | Rom file |
 | -------- | ------- |----|
