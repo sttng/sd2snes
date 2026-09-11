@@ -14,24 +14,11 @@ project; no third-party HDL is used.
 | file | contents |
 |---|---|
 | `/sd2snes/fpga_st0018.bit` (mk2) / `.bi3` (mk3) | this core |
-| `/sd2snes/st018.rom` | 163 840 bytes: 128 KB program ROM followed by 32 KB data ROM, the image MAME/bsnes/Mesen use (known good: md5 `dafae0e0c71c924075811c595c61a30e`) |
+| `/sd2snes/st018.rom` | 163 840 bytes: 128 KB program ROM followed by 32 KB data ROM, the image MAME/Ares/Mesen use (known good: md5 `dafae0e0c71c924075811c595c61a30e`) |
 
 A missing file is reported by the menu before anything is loaded
 (`load_check_prereqs`). With the known-good image the MCU log shows
 `ST018 firmware loaded and verified (sum 00eae5da)`.
-
-## What was removed, and why
-
-| removed | why it can go | frees |
-|---|---|---|
-| uPD96050 (`upd77c25*.v`, datram, datrom) | replaced by the ST018 | 1 998 LUT, 12 RAMB16 (ST011 mk2 build) |
-| MSU-1, audio DAC | as in the ST011 core; no ST018 cart uses them | 9 RAMB16 / 18 M9K |
-| `ctx.v` (WRAM/APU shadow) | only feeds full savestates; `savestate.c` never enables savestates or the in-game handler on a core outside `core_has_snapshot`, and `FPGA_ST0018` is not on that list | 869 LUT (mk2) |
-| `dma.v` (`$2020` copier) | only used by that handler code; `address.v` ties `dma_enable` low, so `$2020-$202F` is ordinary open bus | 475 LUT (mk2) |
-
-Removing `ctx`/`dma` is what makes the mk2 fit (see Budget). Their outputs are
-tied to constants in `main.v`, so the PSRAM-arbiter branches that served them
-constant-fold away.
 
 ## Design
 
@@ -42,9 +29,7 @@ semantics, MUL/MLA, LDR/STR/LDRB/STRB in all addressing modes (rotated
 unaligned word loads), LDM/STM in all modes (S bit, user bank, PC in list,
 empty list), SWP/SWPB, B/BL, SWI, MRS/MSR, the undefined-instruction trap and
 register banking for every mode. No IRQ/FIQ/abort inputs (the ST018 has no
-source for them) and no 26-bit modes. Where the architecture leaves room,
-behaviour follows MesenCE (e.g. R15+12 for register-specified shifts and for a
-stored PC).
+source for them) and no 26-bit modes. 
 
 Each cycle is kept shallow for CLK2 = 96 MHz: operand fetch, shift, ALU and
 write-back are separate states, and a one-entry prefetch buffer fetches the
@@ -57,7 +42,7 @@ saves ~350 LUTs on the mk2, where LUTs are scarce and block RAM is not.
 | `0x0xxxxxxx` | program ROM 128 KB → SRAM `0x00000`, cached |
 | `0xAxxxxxxx` | data ROM 32 KB → SRAM `0x20000`, cached |
 | `0xExxxxxxx` | work RAM 16 KB, block RAM |
-| `0x4xxxxxxx` | I/O: `+00` W byte to host; `+10` R byte from host, W signal; `+20` R status. The timer registers `+20..+2C` are accepted and ignored (they have no observable effect in MesenCE or ares). |
+| `0x4xxxxxxx` | I/O: `+00` W byte to host; `+10` R byte from host, W signal; `+20` R status. The timer registers `+20..+2C` are accepted and ignored (they have no observable effect in Ares for example). |
 
 Everything else reads 0. Instruction fetches from the I/O region read 0 and
 have no side effects, so speculative prefetch can never disturb the mailbox.
@@ -130,36 +115,6 @@ The real chip is an ARM6 at 21.47 MHz where branches and loads take 3 cycles,
 so this should be roughly on par. The self-test command `$F1` checksums the
 whole 160 KB ROM (compulsory misses, ~15 ms); games issue it at boot.
 
-## Verification
-
-All in simulation. **None of this has run on hardware yet.**
-
-* **CPU lockstep against MesenCE's `ArmV3Cpu`** (Verilator). After every
-  retired instruction the 31 banked registers, CPSR, all five SPSRs and every
-  data access (address, size, data) must match. The reference replays the
-  RTL's I/O reads, so timing differences cannot cause false mismatches; memory
-  latency is randomised.
-  * Real `st018.rom` with a protocol-aware virtual SNES (board upload, engine
-    searches, replies): 5M–10M instructions per seed, several seeds.
-  * Random-instruction ROMs, three seeds, 40M+ instructions: every class, mode
-    switches, SWI/undefined traps, jumps into RAM and data ROM, 790k+ unaligned
-    rotated loads. Architecturally UNPREDICTABLE encodings and self-modifying
-    code inside the reference's 2-deep prefetch window are detected and
-    resynchronised rather than compared (see Notes).
-* **Subsystem** (`st018.v`, Verilator): MCU upload into a timing-checking SRAM
-  model (outputs junk until tAA; checks WE pulse width and data/address
-  stability), the checksum sweep, then the real firmware in lockstep while a
-  virtual SNES drives `$3800-$3804` through the real strobes, including random
-  `$3804` resets mid-execution.
-* **Whole core** (`main.v`, iverilog, mk2 and mk3 configurations): SPI upload
-  with the `MCU_RDY` handshake, `$E5/$F5`, `$EB` release, and SNES bus cycles on
-  the real pins: echo round trips through work RAM and cached ROM, bank and
-  register mirrors, open-bus `$3802`, the signal flag, a `$3804` reset, and
-  addresses that must not be claimed.
-
-The lockstep harness uses MesenCE's `ArmV3Cpu.cpp/.h` as the reference model.
-That code is GPL-3.0, so it is not included here and is never part of any build
-output; the harness is test-only.
 
 ## Notes
 
