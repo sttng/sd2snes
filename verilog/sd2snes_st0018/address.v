@@ -235,7 +235,7 @@ assign exe_enable =                           (!SNES_ADDR[22] && ((SNES_ADDR[15:
 assign map_enable =                           (!SNES_ADDR[22] && ((SNES_ADDR[15:0] & 16'hffff) == 16'h2BB2));
 
 // ST018: host registers at $00-3F/$80-BF:3800-38FF (A2:A1 select, A0 and
-// A7:A3 ignored -- MesenCE decodes addr & $FF06). Unconditional: this core is
+// A7:A3 ignored. Unconditional: this core is
 // only ever loaded for ST018 carts (the cart is identified by core, not by a
 // featurebit -- all 16 featurebits are allocated, see src/fpga_spi.h).
 assign st018_enable = !SNES_ADDR[22] && (SNES_ADDR[15:8] == 8'h38);
