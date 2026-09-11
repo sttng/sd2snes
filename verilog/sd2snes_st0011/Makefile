@@ -8,7 +8,7 @@ CORE = st0011
 # is low, i.e. between FPGA configuration and the MCU's feature write.
 # Dropping MSU-1 alone is enough to fit the mk2 XC3S400: 15 of 16 BRAM.
 
-VSRC = address.v cheat.v clk_test.v ctx.v dcm.v dma.v upd77c25.v \
+VSRC = address.v cheat.v clk_test.v dcm.v dma.v upd77c25.v \
        upd77c25_extpgm.v main.v mcu_cmd.v sd_dma.v spi.v
 VHSRC =
 

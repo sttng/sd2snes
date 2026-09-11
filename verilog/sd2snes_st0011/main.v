@@ -483,37 +483,36 @@ assign DAC_STATUS = 1'b0;   // 1-bit, per mcu_cmd.v's port
 assign MSU_SNES_DATA_OUT = 8'h00;
 assign msu_status_out = 8'h00;
 
+wire CTX_WRQ;
+wire CTX_WORD;
+wire ctx_wr_enable;
+wire ctx_pawr_enable;
+wire ctx_pard_enable;
+wire [7:0] CTX_DBG;
 wire [23:0] CTX_ADDR;
 wire [15:0] CTX_DOUT;
 
-ctx snes_ctx (
-  .clkin(CLK2),
-  .reset(SNES_reset_strobe),
-
-  .SNES_ADDR(SNES_ADDR),
-  .SNES_PA(SNES_PA),
-  .SNES_RD_end_PRE(SNES_RD_end),
-  .SNES_WR_end_PRE(SNES_SNOOPWR_end),
-  .SNES_PARD_end_PRE(SNES_SNOOPPARD_end),
-  .SNES_PAWR_end_PRE(SNES_SNOOPPAWR_end),
-  .SNES_DATA_IN_PRE(CTX_SNES_DATA_IN), // needs to handle PA accesses, too
-
-  //.OE_RD_ENABLE(ctx_rd_enable),
-  .OE_WR_ENABLE(ctx_wr_enable),
-  .OE_PAWR_ENABLE(ctx_pawr_enable),
-  .OE_PARD_ENABLE(ctx_pard_enable),
-
-  .BUS_WRQ(CTX_WRQ),
-  .BUS_RDY(CTX_RDY),
-
-  .snescmd_unlock(snescmd_unlock),
-
-  .ROM_ADDR(CTX_ADDR),
-  .ROM_DATA(CTX_DOUT),
-  .ROM_WORD_ENABLE(CTX_WORD),
-  
-  .DBG(CTX_DBG)
-);
+// ---------------------------------------------------------------------------
+// Savestate context capture (ctx.v) is NOT instantiated in this core.
+//
+// ctx.v snoops the SNES bus continuously to capture CPU/PPU state for
+// savestates. This core never takes savestates -- savestate.c gates dsp_ok
+// on fpga_conf == FPGA_DSP and this loads as FPGA_ST0011 -- so it was live
+// logic that can never be reached, in a design running at 89% slice
+// occupancy with TS_CLK21 unmet.
+//
+// Its OE_*_ENABLE outputs are connected nowhere else in main.v, so the only
+// real consumers are the PSRAM arbiter ports, tied off here. CTX_RDY is an
+// arbiter output that simply goes unread now.
+// ---------------------------------------------------------------------------
+assign CTX_WRQ  = 1'b0;
+assign CTX_ADDR = 24'h000000;
+assign CTX_DOUT = 16'h0000;
+assign CTX_WORD = 1'b0;
+assign ctx_wr_enable   = 1'b0;
+assign ctx_pawr_enable = 1'b0;
+assign ctx_pard_enable = 1'b0;
+assign CTX_DBG  = 8'h00;
 
 wire [23:0] DMA_ADDR;
 wire [15:0] DMA_DOUT;
