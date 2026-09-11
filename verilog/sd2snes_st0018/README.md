@@ -6,8 +6,7 @@ written from scratch (`st018_cpu.v`), 16 KB of work RAM, a ROM cache and the
 host mailbox (`st018.v`). The chip's 160 KB firmware (`st018.rom`) is loaded
 by the MCU into the Bus 2 SRAM.
 
-Derived from `sd2snes_st0011`. Everything is GPL-2.0 like the rest of the
-project; no third-party HDL is used.
+Derived from `sd2snes_st0011`.
 
 ## Files on the SD card
 
