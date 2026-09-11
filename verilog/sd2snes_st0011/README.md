@@ -3,8 +3,16 @@
 uPD96050 core for **ST011 only** (Hayazashi Nidan Morita Shougi 2).
 Targets **mk2 (Spartan-3 XC3S400)** and **mk3 (Cyclone IV EP4CE15)**.
 
+Needs 
+
+
+| SHA256 Hash     | MD5 Hash | Rom file |
+| -------- | ------- |----|
+| 8B2B3F3F3E6E29F4D21D8BC736B400BC988B7D2214EBEE15643F01C1FEE2F364  | 5C209CE0283632B6574AD835BF862BEE    | st011.rom | 
+
+
 **ST010 is not supported by this core and must not be routed to it.**
-ST010 stays on `sd2snes_dsp`, which is untouched by any of this work.
+ST010 stays on `sd2snes_dsp`, which is untouched.
 `smc.c` selects between them: ST010 keeps `fpga_conf = FPGA_DSP`, ST011
 gets `FPGA_ST0011`. The two chips are separated by CORE, not by featurebit
 — there is no free bit to split them with (see the note in `fpga_spi.h`),
