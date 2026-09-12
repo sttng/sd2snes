@@ -240,6 +240,113 @@ module upd77c25_extpgm (
   // unchanged and simply goes unused at 0.
   parameter READ_VERIFY = 0;
 
+  // ---- LOOP BUFFER ------------------------------------------------------
+  //
+  // A small fully-associative buffer of recently-fetched words, in
+  // flip-flops. Checked in parallel with the cache and hit with ZERO
+  // latency, so a hit costs no stall cycles.
+  //
+  // Why this instead of a bigger cache: the direct-mapped cache is prewarmed
+  // over words 0..(2^CACHE_BITS-1) only, and anything above that both misses
+  // and evicts a prewarmed entry through index aliasing. Growing it does not
+  // fit -- 8192 entries needs 12 RAMB16 on mk2 against the 6 in use. But the
+  // requirement is not "hold the program", it is "hold the transfer loop
+  // during a transfer": of the 382 real-time windows in the reference trace,
+  // 380 execute exactly FOUR consecutive words. Eight entries is twice that,
+  // and costs no block RAM at all.
+  //
+  // Sized 8 rather than 16 deliberately -- this is a combinational compare
+  // feeding `ready`, and mk2 only just closed timing. Raise it if the fitter
+  // has room; 0 removes the feature.
+  parameter LOOPBUF_ENTRIES = 8;
+  localparam LB_IDX = (LOOPBUF_ENTRIES <= 2) ? 1 : (LOOPBUF_ENTRIES <= 4) ? 2
+                    : (LOOPBUF_ENTRIES <= 8) ? 3 : 4;
+
+  // Packed vectors, not arrays: `always @*` does not re-trigger on writes to
+  // a Verilog memory in several simulators, so an array-based associative
+  // lookup reads stale and never hits. Packed also keeps this in LUTs rather
+  // than inferring a RAM, which is the point.
+  reg [14*LOOPBUF_ENTRIES-1:0] lb_tag;
+  reg [24*LOOPBUF_ENTRIES-1:0] lb_data;
+  reg [LOOPBUF_ENTRIES-1:0]    lb_val;
+  reg [LB_IDX-1:0] lb_next;
+  initial begin lb_tag=0; lb_data=0; lb_val=0; lb_next=0; end
+
+  // XST rejects a variable index into a packed vector ("Variable index is
+  // not supported in signal"), so both the lookup and the write are built
+  // with generate/genvar -- every index is then constant at elaboration.
+  wire [LOOPBUF_ENTRIES-1:0] lb_match;
+  wire [LOOPBUF_ENTRIES-1:0] lb_first;
+  wire [23:0] lb_chain [0:LOOPBUF_ENTRIES];
+  assign lb_chain[0] = 24'd0;
+
+  genvar lbg;
+  generate
+    for(lbg = 0; lbg < LOOPBUF_ENTRIES; lbg = lbg + 1) begin : LB
+      assign lb_match[lbg] = lb_val[lbg] && (lb_tag[14*lbg +: 14] == pc);
+      // one-hot OR chain rather than a priority mux: duplicate entries for
+      // the same pc hold identical data, so OR-ing is safe.
+      // Priority, not plain OR: take the LOWEST matching entry. If two
+      // entries ever held the same pc with different data, OR-ing them
+      // returns garbage rather than either value.
+      assign lb_first[lbg] = lb_match[lbg] & ~|(lb_match & ((1<<lbg)-1));
+      assign lb_chain[lbg+1] = lb_chain[lbg]
+                             | (lb_first[lbg] ? lb_data[24*lbg +: 24] : 24'd0);
+    end
+  endgenerate
+
+  wire        lb_hit_r    = |lb_match;
+  wire [23:0] lb_hit_data = lb_chain[LOOPBUF_ENTRIES];
+  wire lb_hit = (LOOPBUF_ENTRIES != 0) && lb_hit_r && enable;
+
+  // Write port. lb_insert registers the request; the generate block below
+  // applies it one cycle later, which is why the index is captured rather
+  // than read from lb_next (which has already advanced).
+  reg              pgm_wr_r;
+  always @(posedge CLK) pgm_wr_r <= PGM_WR;
+
+  reg              lb_wr;
+  reg [LB_IDX-1:0] lb_wr_idx;
+  reg [13:0]       lb_wr_addr;
+  reg [23:0]       lb_wr_data;
+  initial begin pgm_wr_r = 1'b0; lb_wr = 1'b0; lb_wr_idx = 0; lb_wr_addr = 0; lb_wr_data = 0; end
+
+  generate
+    for(lbg = 0; lbg < LOOPBUF_ENTRIES; lbg = lbg + 1) begin : LBW
+      always @(posedge CLK) begin
+        // PGM_WR invalidates, and so does the cycle after it: lb_insert
+        // registers its write, so an insert issued just before a firmware
+        // write would otherwise land one cycle LATER and re-insert the
+        // stale pre-write word. extpgm_tb catches exactly this.
+        // Invalidate for the WHOLE write sequence, not just the PGM_WR
+        // pulse. The SRAM write takes many cycles; a fetch already in
+        // flight completes with PRE-write data and lb_insert lands after
+        // it, re-inserting a stale word. The same hazard is why
+        // pc_last_done is reset and the cache entry invalidated here.
+        if(PGM_WR || pgm_wr_r || wr_busy)   lb_val[lbg] <= 1'b0;
+        else if(lb_wr && (lb_wr_idx == lbg)) begin
+          lb_tag [14*lbg +: 14] <= lb_wr_addr;
+          lb_data[24*lbg +: 24] <= lb_wr_data;
+          lb_val [lbg]          <= 1'b1;
+        end
+      end
+    end
+  endgenerate
+
+  task lb_insert;
+    input [13:0] a;
+    input [23:0] d;
+    begin
+      if(LOOPBUF_ENTRIES != 0) begin
+        lb_wr      <= 1'b1;
+        lb_wr_idx  <= lb_next;
+        lb_wr_addr <= a;
+        lb_wr_data <= d;
+        lb_next    <= lb_next + 1'b1;
+      end
+    end
+  endtask
+
   /* Fetch program words from the main PSRAM rather than the Bus 2 SRAM.
      Rationale: PSRAM is 16-bit (2 accesses per 24-bit word vs 3), and it
      is proven -- it carries the game ROM and is read continuously at full
@@ -514,14 +621,16 @@ module upd77c25_extpgm (
   // servable in the same cycle -- pc_last_done catches up one cycle
   // later, purely so the value stays held if pc stops changing.
   assign ready = ~enable
-               | (((pc_last_done == pc) | cache_hit_now)
+               | (((pc_last_done == pc) | cache_hit_now | lb_hit)
                   & ~wr_busy & ~prewarm_active);
 
   // Priority matters: pc_last_done is the authority whenever it matches,
   // because during the fill cycle of an external read the cache array is
   // being written at this very address and its read-during-write value
   // is not defined.
-  assign dout = (pc_last_done == pc) ? dout_r : cache_rdata;
+  assign dout = (pc_last_done == pc) ? dout_r
+              : lb_hit                ? lb_hit_data
+              :                         cache_rdata;
 
   wire pc_stale = enable && (pc_last_done != pc);
 
@@ -576,6 +685,7 @@ module upd77c25_extpgm (
         else init_addr <= init_addr + 1'b1;
       end
       psram_rrq <= 1'b0;
+    lb_wr <= 1'b0;
       if(cache_ready)
       case(pstate)
         P_IDLE: begin
@@ -608,6 +718,7 @@ module upd77c25_extpgm (
             // reassembled with the same byte-order correction the SRAM
             // path uses, so the CPU sees the same instruction either way
             dout_r <= {pword0[7:0], pword0[15:8], psram_din[7:0]};
+            lb_insert(pc_r, {pword0[7:0], pword0[15:8], psram_din[7:0]});
             lo_we = 1'b1; lo_addr = pc_r[CACHE_BITS-1:0];
             lo_data = {pc_r[13:CACHE_BITS], pword0[15:8], psram_din[7:0]};
             hi_we = 1'b1; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, pword0[7:0]};
@@ -751,6 +862,7 @@ module upd77c25_extpgm (
             // wr_pending branch above and never reaches here.
             dout_r <= cache_rdata;
             pc_last_done <= pc;
+            lb_insert(pc, cache_rdata);
             state <= S_IDLE;
           end else begin
             // Miss (or cache disabled): the existing, unmodified
@@ -949,6 +1061,7 @@ module upd77c25_extpgm (
           end else if(READ_VERIFY == 0) begin
             dout_r <= {byte0, byte1, ram_data_s2};
             pc_last_done <= pc_r;
+            lb_insert(pc_r, {byte0, byte1, ram_data_s2});
             lo_we = 1'b1; lo_addr = pc_r[CACHE_BITS-1:0];
             lo_data = {pc_r[13:CACHE_BITS], byte1, ram_data_s2};
             hi_we = 1'b1; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
@@ -963,6 +1076,7 @@ module upd77c25_extpgm (
             // Two consecutive reads agree -- commit.
             dout_r <= rd_word_a;
             pc_last_done <= pc_r;
+            lb_insert(pc_r, rd_word_a);
             lo_we = 1'b1; lo_addr = pc_r[CACHE_BITS-1:0];
             lo_data = {pc_r[13:CACHE_BITS], rd_word_a[15:0]};
             hi_we = 1'b1; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, rd_word_a[23:16]};
@@ -975,6 +1089,7 @@ module upd77c25_extpgm (
             verify_errors <= verify_errors + 1'b1;
             dout_r <= {byte0, byte1, ram_data_s2};
             pc_last_done <= pc_r;
+            lb_insert(pc_r, {byte0, byte1, ram_data_s2});
             lo_we = 1'b1; lo_addr = pc_r[CACHE_BITS-1:0];
             lo_data = {pc_r[13:CACHE_BITS], byte1, ram_data_s2};
             hi_we = 1'b1; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};

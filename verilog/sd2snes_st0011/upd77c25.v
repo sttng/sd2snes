@@ -104,6 +104,10 @@ parameter PC_LOOKAHEAD = 1;
 // prewarm; see that module's PREWARM block for what it is for.
 parameter PREWARM_ENABLE = 1;
 
+// Entries in the fetch unit's fully-associative loop buffer (0 disables).
+// See the LOOP BUFFER note in upd77c25_extpgm.v.
+parameter LOOPBUF_ENTRIES = 8;
+
 // Passed through to upd77c25_extpgm. 1 reads every MISSED word twice and
 // commits only on agreement; 0 reads it once. 0 halves the cost of a
 // cache miss (60.5 -> 31.0 cycles at 96MHz) and is the setting ST011
