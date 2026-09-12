@@ -567,7 +567,8 @@ st018 #(.CACHE_LB(ST018_CACHE_LB)) snes_st018 (
 );
 
 // $3800/$3804 (A1 = 0) drive the bus on reads; $3802/$3806 reads are open
-// bus. Writes need the buffer enabled either way.
+// bus (the references decode addr & $FF06). Writes need the buffer enabled
+// either way.
 wire st018_bus = st018_enable & ~(SNES_ADDR[1] & ~SNES_READ);
 
 reg [7:0] MCU_DINr;

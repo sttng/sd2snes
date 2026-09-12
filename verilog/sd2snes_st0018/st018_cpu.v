@@ -6,7 +6,8 @@
 //
 // Design goals, in order:
 //   1. Architecturally correct for the 32-bit ARMv3 instruction set the ST018
-//      firmware uses.
+//      firmware uses (verified in lockstep against an external reference
+//      ARMv3 interpreter; see sim/lockstep/).
 //   2. Small enough for the mk2's XC3S400 next to the sd2snes base logic.
 //   3. Shallow logic per cycle so it runs directly from CLK2 (96 MHz).
 //
@@ -26,7 +27,8 @@
 // Not implemented (the ST018 has no source for them): IRQ/FIQ inputs,
 // abort inputs, 26-bit address modes, coprocessor interface.
 //
-// Edge-case policy follows Ares where the architecture leaves room
+// Edge-case policy follows the reference interpreter where the architecture
+// leaves room
 // (R15+12 for register-specified shifts and stores of PC, LDM/STM writeback
 // timing, empty register list), because that is the implementation the game
 // is known to run on.
@@ -614,7 +616,7 @@ always @(posedge clk) begin
           end
         end else if (c_psr) begin
           // MSR: the register operand is Rm itself -- bits 11:4 are SBZ and
-          // never select a shift (R15 reads as PC+8)
+          // never select a shift (R15 reads as PC+8, as in the reference)
           if (b_I) begin
             opB   <= {24'd0, ir[7:0]};
             shout <= {24'd0, ir[7:0]};
@@ -663,7 +665,7 @@ always @(posedge clk) begin
 
       S_WB: begin
         // S with Rd=15 restores the SPSR; in USR/SYS (no SPSR) the flags are
-        // simply updated (Ares behaviour; architecturally unpredictable)
+        // simply updated (reference behaviour; architecturally unpredictable)
         if (b_S && (rd != 4'd15 || !has_spsr)) begin
           f_n <= res[31];
           f_z <= (res == 32'd0);

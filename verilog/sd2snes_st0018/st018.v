@@ -3,7 +3,7 @@
 // st018.v -- Seta ST018 (ARMv3 coprocessor) for sd2snes
 //
 // Written for sd2snes (GPL-2.0). Behaviour of the host/ARM mailbox follows
-// the Ares implementations (the only public references).
+// the published emulator implementations (the only public references).
 //
 // ARM address map (bits 31:29 select the region, as on the real chip):
 //   0x0xxxxxxx  program ROM 128 KB (mirrored)  -> Bus 2 SRAM 0x00000, cached

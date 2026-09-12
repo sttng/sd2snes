@@ -6,18 +6,32 @@ written from scratch (`st018_cpu.v`), 16 KB of work RAM, a ROM cache and the
 host mailbox (`st018.v`). The chip's 160 KB firmware (`st018.rom`) is loaded
 by the MCU into the Bus 2 SRAM.
 
-Derived from `sd2snes_st0011`.
+Derived from `sd2snes_st0011`. Everything is GPL-2.0 like the rest of the
+project; no third-party HDL is used.
 
 ## Files on the SD card
 
 | file | contents |
 |---|---|
 | `/sd2snes/fpga_st0018.bit` (mk2) / `.bi3` (mk3) | this core |
-| `/sd2snes/st018.rom` | 163 840 bytes: 128 KB program ROM followed by 32 KB data ROM, the image MAME/Ares/Mesen use (known good: md5 `dafae0e0c71c924075811c595c61a30e`) |
+| `/sd2snes/st018.rom` | 163 840 bytes: 128 KB program ROM followed by 32 KB data ROM, the image Ares uses (known good: md5 `dafae0e0c71c924075811c595c61a30e`) |
 
 A missing file is reported by the menu before anything is loaded
 (`load_check_prereqs`). With the known-good image the MCU log shows
 `ST018 firmware loaded and verified (sum 00eae5da)`.
+
+## What was removed, and why
+
+| removed | why it can go | frees |
+|---|---|---|
+| uPD96050 (`upd77c25*.v`, datram, datrom) | replaced by the ST018 | 1 998 LUT, 12 RAMB16 (ST011 mk2 build) |
+| MSU-1, audio DAC | as in the ST011 core; no ST018 cart uses them | 9 RAMB16 / 18 M9K |
+| `ctx.v` (WRAM/APU shadow) | only feeds full savestates; `savestate.c` never enables savestates or the in-game handler on a core outside `core_has_snapshot`, and `FPGA_ST0018` is not on that list | 869 LUT (mk2) |
+| `dma.v` (`$2020` copier) | only used by that handler code; `address.v` ties `dma_enable` low, so `$2020-$202F` is ordinary open bus | 475 LUT (mk2) |
+
+Removing `ctx`/`dma` is what makes the mk2 fit (see Budget). Their outputs are
+tied to constants in `main.v`, so the PSRAM-arbiter branches that served them
+constant-fold away.
 
 ## Design
 
@@ -28,7 +42,9 @@ semantics, MUL/MLA, LDR/STR/LDRB/STRB in all addressing modes (rotated
 unaligned word loads), LDM/STM in all modes (S bit, user bank, PC in list,
 empty list), SWP/SWPB, B/BL, SWI, MRS/MSR, the undefined-instruction trap and
 register banking for every mode. No IRQ/FIQ/abort inputs (the ST018 has no
-source for them) and no 26-bit modes. 
+source for them) and no 26-bit modes. Where the architecture leaves room,
+behaviour follows the reference interpreter used for verification (e.g. R15+12
+for register-specified shifts and for a stored PC).
 
 Each cycle is kept shallow for CLK2 = 96 MHz: operand fetch, shift, ALU and
 write-back are separate states, and a one-entry prefetch buffer fetches the
@@ -41,7 +57,7 @@ saves ~350 LUTs on the mk2, where LUTs are scarce and block RAM is not.
 | `0x0xxxxxxx` | program ROM 128 KB → SRAM `0x00000`, cached |
 | `0xAxxxxxxx` | data ROM 32 KB → SRAM `0x20000`, cached |
 | `0xExxxxxxx` | work RAM 16 KB, block RAM |
-| `0x4xxxxxxx` | I/O: `+00` W byte to host; `+10` R byte from host, W signal; `+20` R status. The timer registers `+20..+2C` are accepted and ignored (they have no observable effect in Ares for example). |
+| `0x4xxxxxxx` | I/O: `+00` W byte to host; `+10` R byte from host, W signal; `+20` R status. The timer registers `+20..+2C` are accepted and ignored (they have no observable effect in either published emulator implementation). |
 
 Everything else reads 0. Instruction fetches from the I/O region read 0 and
 have no side effects, so speculative prefetch can never disturb the mailbox.
@@ -67,6 +83,42 @@ project's "pack I/O registers" setting; mk3: `FAST_*_REGISTER` assignments in
 Bit 5 must read 0: the firmware jumps to `0x60000000` if it is set. Bit 7
 reflects both reset sources (`$3804` and the MCU hold). A console reset
 (`SNES_reset_strobe`) resets the ARM and clears the mailbox.
+
+## SaveRAM
+
+The board (ares calls it ARM-LOROM-RAM) puts its 8 KB battery SRAM at
+**banks `$68-$6F` and `$F0-$FF`, offset `$0000-$7FFF`** — not only at the
+`$70-$7D/$F0-$FF` window the generic LoROM rule in `address.v` decodes. The
+game uses the `$68` window exclusively: its save and load routines at
+`$00:CCB8` and `$00:CCD2` copy `$0E80` bytes between `$68:0180` and `$7E:4180`
+with long addressing. With only the generic rule the writes go nowhere and the
+reads return ROM, so the game appears to save and then finds no file.
+`address.v` therefore adds the `$68-$6F` window for this core (bit 23
+qualified, so the `$E8-$EF` mirror stays out); `sim/tb_address.v` checks the
+whole 256-bank map, the mapped offsets and that ROM decode is unchanged.
+
+Nothing is needed on the MCU side: the header's RAM size (`$03` = 8 KB) is
+used as-is, and the mapped offset (`address & $1FFF`) matches what other
+emulators write, so `.srm` files are interchangeable.
+
+## What the game needs (from its SNES code, `$00:E717-$F0A0`)
+
+* Power-on (`$EFBD-$F09D`): wait for status bit 7, reset the ARM through
+  `$3804` (`00`, `FF`, `00`, then wait for bit 7), send `$F1` and `$F2`.
+  `$F1` (`0x5e4`: program/data-ROM checksums against values stored in the
+  firmware, work-RAM pattern tests) must answer with bit 2 clear, `$F2`
+  (`0x658`: further memory tests) with `$00`; otherwise the game prints
+  `E1`/`E2` plus the failing address and hangs. They take 45.6 ms / 11.9 ms
+  on this core.
+* Before every transfer (`$E892`) status bit 4 must be 0.
+* Status bit 6 is only waited for if the ROM byte `$FF41` is non-zero; it is
+  `$00` in this game, and neither published emulator implements bit 6.
+* Every SNES-side wait is an unbounded status poll: the ARM's speed affects
+  thinking time only, never correctness.
+* The ARM reads status as a 32-bit word at `0x120` and in its send routine
+  (`0x764`, `0x774`), but each read tests exactly one low bit (`TST #32`,
+  `TST #1`), so the upper 24 bits are never observed. This core returns the
+  status byte zero-extended.
 
 ## MCU side
 
@@ -114,6 +166,56 @@ The real chip is an ARM6 at 21.47 MHz where branches and loads take 3 cycles,
 so this should be roughly on par. The self-test command `$F1` checksums the
 whole 160 KB ROM (compulsory misses, ~15 ms); games issue it at boot.
 
+## Verification
+
+All in simulation. **None of this has run on hardware yet.**
+
+* **CPU lockstep against an external reference ARMv3 interpreter** (Verilator).
+  After every retired instruction the 31 banked registers, CPSR, all five
+  SPSRs and every data access (address, size, data) must match. The reference replays the
+  RTL's I/O reads, so timing differences cannot cause false mismatches; memory
+  latency is randomised.
+  * Real `st018.rom` with a protocol-aware virtual SNES (board upload, engine
+    searches, replies): 5M–10M instructions per seed, several seeds.
+  * Random-instruction ROMs, three seeds, 40M+ instructions: every class, mode
+    switches, SWI/undefined traps, jumps into RAM and data ROM, 790k+ unaligned
+    rotated loads. Architecturally UNPREDICTABLE encodings and self-modifying
+    code inside the reference's 2-deep prefetch window are detected and
+    resynchronised rather than compared (see Notes).
+* **Subsystem** (`st018.v`, Verilator): MCU upload into a timing-checking SRAM
+  model (outputs junk until tAA; checks WE pulse width and data/address
+  stability), the checksum sweep, then the real firmware in lockstep while a
+  virtual SNES drives `$3800-$3804` through the real strobes, including random
+  `$3804` resets mid-execution.
+* **Whole core** (`main.v`, iverilog, mk2 and mk3 configurations): SPI upload
+  with the `MCU_RDY` handshake, `$E5/$F5`, `$EB` release, and SNES bus cycles on
+  the real pins: echo round trips through work RAM and cached ROM, bank and
+  register mirrors, open-bus `$3802`, the signal flag, a `$3804` reset, and
+  addresses that must not be claimed.
+
+* **The game's own power-on sequence** on the subsystem (`-boot`): `$3804`
+  reset, `$F1` → `$00` (so the firmware's stored ROM checksums match what it
+  reads through SRAM + cache, and the RAM tests pass), `$F2` → `$00`.
+* **Replay of real emulator recordings of the game** (`sim/trace/`, streamed,
+  works on multi-GB zips): the RTL executes the recorded ARM instruction
+  stream; I/O reads come from the recording; after every instruction
+  R0-R14, flags, mode and the next PC must equal the recorded state.
+  * 26.5 GB recording, 12.6 s of play (board uploads `$AA`, engine commands
+    `$B3-$B5`, 500 bytes each way): **91 750 812 instructions, all matching**.
+  * computer-move recording, 17.3 GB, 8.2 s (board uploads `$AA`, engine
+    commands `$B4`/`$B5`): **59 957 877 instructions, all matching**; it
+    reaches engine code around `0x163A4-0x16D30` and `0x1C944-0x1CB50` that
+    the longer recording never entered.
+  * two power-cycle recordings (frames 34 and 124, idle after the self-test):
+    121 042 instructions each, all matching.
+  * No recording contains a single multiply, mode switch, SWP or MSR: the
+    game's ARM code never uses them. Those paths are covered by the
+    random-instruction lockstep tests above, not by a recording.
+
+The lockstep harness needs an external ARMv3 interpreter as its reference model
+(`ArmV3Cpu.cpp`, `ArmV3Cpu.h`, `ArmV3Types.h`; pass the directory holding them
+to `sim/lockstep/run.sh`). That code is GPL-3.0 third-party source, so it is not
+included here and is never part of any build output; the harness is test-only.
 
 ## Notes
 

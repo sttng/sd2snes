@@ -119,11 +119,27 @@ assign IS_SAVERAM_pre = (~map_unlock & SAVERAM_MASK[0])
                          & !SNES_ADDR_early[15]
                         )
 /*  LoROM:   SRAM @ Bank 0x70-0x7d, 0xf0-0xff
- *  Offset 0000-7fff for ROM >= 32 MBit, otherwise 0000-ffff */
+ *  Offset 0000-7fff for ROM >= 32 MBit, otherwise 0000-ffff
+ *
+ *  ST018 board (ares: ARM-LOROM-RAM, "map address=68-6f,f0-ff:0000-7fff"):
+ *  the 8 KB SaveRAM also answers at banks 0x68-0x6f, offset 0000-7fff, and
+ *  that is the window the game actually uses -- its save/load routines at
+ *  $00:CCB8 and $00:CCD2 copy 0x0E80 bytes between $68:0180 and $7E:4180
+ *  with long addressing. Without this window the writes go nowhere and the
+ *  reads return ROM, so the game appears to save and then finds no file.
+ *  Unconditional here: this core is only ever loaded for ST018 carts.
+ *  Bit 23 is qualified so the 0xe8-0xef mirror stays out, matching the
+ *  board; the 0xf0-0xff half is already covered by the rule above. */
                       :(MAPPER_DEC[3'b001])
-                      ? (&SNES_ADDR_early[22:20]
-                         & (~SNES_ROMSEL)
-                         & (~SNES_ADDR_early[15] | ~ROM_MASK[21])
+                      ? ((&SNES_ADDR_early[22:20]
+                          & (~SNES_ROMSEL)
+                          & (~SNES_ADDR_early[15] | ~ROM_MASK[21])
+                         )
+                         | (~SNES_ADDR_early[23]
+                            & (SNES_ADDR_early[22:19] == 4'b1101)
+                            & (~SNES_ROMSEL)
+                            & ~SNES_ADDR_early[15]
+                           )
                         )
 /*  Menu mapper: 8Mbit "SRAM" @ Bank 0xf0-0xff (entire banks!) */
                       :(MAPPER_DEC[3'b111])
@@ -235,7 +251,8 @@ assign exe_enable =                           (!SNES_ADDR[22] && ((SNES_ADDR[15:
 assign map_enable =                           (!SNES_ADDR[22] && ((SNES_ADDR[15:0] & 16'hffff) == 16'h2BB2));
 
 // ST018: host registers at $00-3F/$80-BF:3800-38FF (A2:A1 select, A0 and
-// A7:A3 ignored. Unconditional: this core is
+// A7:A3 ignored -- the reference emulators decode addr & $FF06). Unconditional:
+// this core is
 // only ever loaded for ST018 carts (the cart is identified by core, not by a
 // featurebit -- all 16 featurebits are allocated, see src/fpga_spi.h).
 assign st018_enable = !SNES_ADDR[22] && (SNES_ADDR[15:8] == 8'h38);
