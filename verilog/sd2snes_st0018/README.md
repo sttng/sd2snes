@@ -25,7 +25,7 @@ A missing file is reported by the menu before anything is loaded
 | removed | why it can go | frees |
 |---|---|---|
 | uPD96050 (`upd77c25*.v`, datram, datrom) | replaced by the ST018 | 1 998 LUT, 12 RAMB16 (ST011 mk2 build) |
-| MSU-1, audio DAC | as in the ST011 core; no ST018 cart uses them | 9 RAMB16 / 18 M9K |
+| MSU-1, audio DAC | No ST018 cart uses them | 9 RAMB16 / 18 M9K |
 | `ctx.v` (WRAM/APU shadow) | only feeds full savestates; `savestate.c` never enables savestates or the in-game handler on a core outside `core_has_snapshot`, and `FPGA_ST0018` is not on that list | 869 LUT (mk2) |
 | `dma.v` (`$2020` copier) | only used by that handler code; `address.v` ties `dma_enable` low, so `$2020-$202F` is ordinary open bus | 475 LUT (mk2) |
 
