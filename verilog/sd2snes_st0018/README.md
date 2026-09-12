@@ -94,8 +94,7 @@ game uses the `$68` window exclusively: its save and load routines at
 with long addressing. With only the generic rule the writes go nowhere and the
 reads return ROM, so the game appears to save and then finds no file.
 `address.v` therefore adds the `$68-$6F` window for this core (bit 23
-qualified, so the `$E8-$EF` mirror stays out); `sim/tb_address.v` checks the
-whole 256-bank map, the mapped offsets and that ROM decode is unchanged.
+qualified, so the `$E8-$EF` mirror stays out).
 
 Nothing is needed on the MCU side: the header's RAM size (`$03` = 8 KB) is
 used as-is, and the mapped offset (`address & $1FFF`) matches what other
