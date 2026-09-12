@@ -166,57 +166,6 @@ The real chip is an ARM6 at 21.47 MHz where branches and loads take 3 cycles,
 so this should be roughly on par. The self-test command `$F1` checksums the
 whole 160 KB ROM (compulsory misses, ~15 ms); games issue it at boot.
 
-## Verification
-
-All in simulation. **None of this has run on hardware yet.**
-
-* **CPU lockstep against an external reference ARMv3 interpreter** (Verilator).
-  After every retired instruction the 31 banked registers, CPSR, all five
-  SPSRs and every data access (address, size, data) must match. The reference replays the
-  RTL's I/O reads, so timing differences cannot cause false mismatches; memory
-  latency is randomised.
-  * Real `st018.rom` with a protocol-aware virtual SNES (board upload, engine
-    searches, replies): 5M–10M instructions per seed, several seeds.
-  * Random-instruction ROMs, three seeds, 40M+ instructions: every class, mode
-    switches, SWI/undefined traps, jumps into RAM and data ROM, 790k+ unaligned
-    rotated loads. Architecturally UNPREDICTABLE encodings and self-modifying
-    code inside the reference's 2-deep prefetch window are detected and
-    resynchronised rather than compared (see Notes).
-* **Subsystem** (`st018.v`, Verilator): MCU upload into a timing-checking SRAM
-  model (outputs junk until tAA; checks WE pulse width and data/address
-  stability), the checksum sweep, then the real firmware in lockstep while a
-  virtual SNES drives `$3800-$3804` through the real strobes, including random
-  `$3804` resets mid-execution.
-* **Whole core** (`main.v`, iverilog, mk2 and mk3 configurations): SPI upload
-  with the `MCU_RDY` handshake, `$E5/$F5`, `$EB` release, and SNES bus cycles on
-  the real pins: echo round trips through work RAM and cached ROM, bank and
-  register mirrors, open-bus `$3802`, the signal flag, a `$3804` reset, and
-  addresses that must not be claimed.
-
-* **The game's own power-on sequence** on the subsystem (`-boot`): `$3804`
-  reset, `$F1` → `$00` (so the firmware's stored ROM checksums match what it
-  reads through SRAM + cache, and the RAM tests pass), `$F2` → `$00`.
-* **Replay of real emulator recordings of the game** (`sim/trace/`, streamed,
-  works on multi-GB zips): the RTL executes the recorded ARM instruction
-  stream; I/O reads come from the recording; after every instruction
-  R0-R14, flags, mode and the next PC must equal the recorded state.
-  * 26.5 GB recording, 12.6 s of play (board uploads `$AA`, engine commands
-    `$B3-$B5`, 500 bytes each way): **91 750 812 instructions, all matching**.
-  * computer-move recording, 17.3 GB, 8.2 s (board uploads `$AA`, engine
-    commands `$B4`/`$B5`): **59 957 877 instructions, all matching**; it
-    reaches engine code around `0x163A4-0x16D30` and `0x1C944-0x1CB50` that
-    the longer recording never entered.
-  * two power-cycle recordings (frames 34 and 124, idle after the self-test):
-    121 042 instructions each, all matching.
-  * No recording contains a single multiply, mode switch, SWP or MSR: the
-    game's ARM code never uses them. Those paths are covered by the
-    random-instruction lockstep tests above, not by a recording.
-
-The lockstep harness needs an external ARMv3 interpreter as its reference model
-(`ArmV3Cpu.cpp`, `ArmV3Cpu.h`, `ArmV3Types.h`; pass the directory holding them
-to `sim/lockstep/run.sh`). That code is GPL-3.0 third-party source, so it is not
-included here and is never part of any build output; the harness is test-only.
-
 ## Notes
 
 * **`spi.v` differs from upstream in one place.** `cmd_ready_r2` and
