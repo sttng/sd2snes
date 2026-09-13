@@ -124,6 +124,8 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
   props->has_spc7110_rtc = 0;
   props->has_cx4 = 0;
   props->has_obc1 = 0;
+  props->has_obc1 = 0;
+  props->has_col20 = 0;
   props->has_gsu = 0;
   props->has_fx3 = 0;
   props->has_sa1 = 0;
@@ -171,7 +173,38 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
       return;
     }
   }
-
+  /* Korean "Super 20 in 1" LoROM pirate multicart: 32 banks of 32KB, no valid
+   header on bank 0 (menu/launcher code). Detected by the embedded LoROM
+   header MAME's sns_rom_20col_device documents on bank 6 (Spartan X),
+   byte-identical across the known dump. Needs its own FPGA core
+   (sd2snes_col20) because the bank-select register at $808000 is live,
+   write-triggered state the base LoROM decode has no room for -- see
+   verilog/sd2snes_col20/col20.v. */
+{
+  static const uint8_t col20_bank6_hdr[32] = {
+    0x53, 0x70, 0x61, 0x72, 0x74, 0x61, 0x6e, 0x20,   /* "Spartan " */
+    0x58, 0x20, 0x53, 0x66, 0x63, 0x20, 0x20, 0x20,   /* "X Sfc   " */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x08,
+    0x00, 0x0d, 0x01, 0x01, 0xff, 0xff, 0x00, 0x00
+  };
+  uint8_t col20_hdr[32];
+  smc_readblock(col20_hdr, 0x37fc0, sizeof(col20_hdr), file_offset);
+  if(!memcmp(col20_hdr, col20_bank6_hdr, sizeof(col20_hdr))) {
+    memset(header, 0, sizeof(snes_header_t));
+    props->mapper_id        = 1;             /* LoROM -- MAPPER input to the core is still 3'b001 */
+    props->offset           = 0;
+    props->header_address   = 0;
+	props->has_col20        = 1;
+    props->fpga_conf        = FPGA_COL20;
+    props->fpga_features    = 0;             /* this core doesn't consume featurebits */
+    props->romsize_bytes    = 0x100000;      /* fixed -- this cart is always exactly 1MB */
+    props->ramsize_bytes    = 0;
+    props->expramsize_bytes = 0;
+    props->sramsize_bytes   = 0;
+    props->srambase         = 0;
+	return;
+  }
+}
   /* Nintendo event carts (Campus Challenge '92 / PowerFest '94), also tested
      before header scoring: the 256 KB multi-game menu chip carries no valid SNES
      header ($7FC0 is code, and one PowerFest score hack even has a donor game's

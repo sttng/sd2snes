@@ -86,6 +86,7 @@ typedef struct __attribute__ ((__packed__)) {
   uint8_t has_msu1;           /* MSU1 presence flag */
   uint8_t has_cx4;            /* CX4 presence flag */
   uint8_t has_obc1;           /* OBC1 presence flag */
+  uint8_t has_col20;          /* col20 presence flag */
   uint8_t has_gsu;            /* GSU presence flag */
   uint8_t has_fx3;            /* cart wants the Super FX 3 behavior of the GSU core */
   uint8_t has_sa1;            /* SA-1 presence flag */
