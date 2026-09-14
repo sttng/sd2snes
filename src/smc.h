@@ -109,6 +109,8 @@ typedef struct __attribute__ ((__packed__)) {
   snes_header_t header;       /* original header from ROM image */
 } snes_romprops_t;
 
+void smc_set_file_span(uint32_t rom_size);
+
 void smc_id(snes_romprops_t*, uint32_t file_offset);
 void smc_id_sdram(snes_romprops_t* props, uint32_t sram_base, uint32_t rom_size);
 void smc_id_sdram_window(snes_romprops_t* props, uint32_t sram_base,
