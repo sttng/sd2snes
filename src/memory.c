@@ -847,28 +847,38 @@ static void load_setup_masks(load_ctx_t *c) {
   }
 
   if (romprops.has_sa1 && romprops.header.carttype == 0x36 && romprops.header.ramsize) {
-    // move iram into saveram for special carts with no bwram
-    romprops.header.ramsize = 1;
-    romprops.ramsize_bytes = 0x800;
-    // override any changes to this so we capture full sram
-    romprops.srambase       = 0;
-    romprops.sramsize_bytes = romprops.ramsize_bytes;
-    rammask = 1;
+  // move iram into saveram for special carts with no bwram
+  romprops.header.ramsize = 1;
+  romprops.ramsize_bytes = 0x800;
+  // override any changes to this so we capture full sram
+  romprops.srambase       = 0;
+  romprops.sramsize_bytes = romprops.ramsize_bytes;
+  rammask = 1;
   } else if(romprops.has_sufami) {
-    /* MAPPED size, deliberately NOT the saveable size: the ST BIOS uses Slot A SaveRAM
-       as scratch and dispatches into it (below $8000), so the window must exist even
-       for a cart with no battery. sramsize_bytes stays 0 there, and that is the field
-       the autosave and the .srm writer key off. */
-    rammask = (romprops.ramsize_bytes > SUFAMI_SLOTA_SCRATCH_SIZE
-               ? romprops.ramsize_bytes : SUFAMI_SLOTA_SCRATCH_SIZE) - 1;
-  } else if(romprops.header.ramsize == 0) {
+  /* MAPPED size, deliberately NOT the saveable size: the ST BIOS uses Slot A SaveRAM
+     as scratch and dispatches into it (below $8000), so the window must exist even
+     for a cart with no battery. sramsize_bytes stays 0 there, and that is the field
+     the autosave and the .srm writer key off. */
+  rammask = (romprops.ramsize_bytes > SUFAMI_SLOTA_SCRATCH_SIZE
+             ? romprops.ramsize_bytes : SUFAMI_SLOTA_SCRATCH_SIZE) - 1;
+   } else if(romprops.mapper_id == 4 && !romprops.fpga_conf) {
+   /*
+    * Gamars Puzzle.
+    *
+    * Header SRAM size is deliberately non-standard ($20), so don't use
+    * header.ramsize to decide whether a RAM window exists.
+    *
+    * smc_id() forces ramsize_bytes/sramsize_bytes to $200 for this ROM.
+    */
+   rammask = romprops.ramsize_bytes - 1;
+   } else if(romprops.header.ramsize == 0) {
     rammask = 0;
-  } else {
-    rammask = romprops.ramsize_bytes - 1;
-  }
-  rommask = romprops.romsize_bytes - 1;
+   } else {
+     rammask = romprops.ramsize_bytes - 1;
+   }
+    rommask = romprops.romsize_bytes - 1;
   
-  if (romprops.has_combo) {
+   if (romprops.has_combo) {
     ramslot = sram_readbyte((romprops.mapper_id == 0 || romprops.mapper_id == 2) ? 0xFFDA : 0x7FDA);
   }
   
