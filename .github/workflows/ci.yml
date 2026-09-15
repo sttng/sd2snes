@@ -15,7 +15,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [ludufre-Feat_SFROM_Support]
   pull_request:
 
 concurrency:
