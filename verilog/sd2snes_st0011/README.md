@@ -197,7 +197,7 @@ stalls at pc=0 rather than executing whatever `ext_pgm_dout` happens to hold.
 Verified in simulation: with `ext_pgm_en` tied low and the core out of reset,
 pc stays at 0 for 2000 clocks.
 
-## Call stack reduced to 8 entries
+## Call stack: 16 entries (a reduction to 8 was tried and REVERTED)
 
 `stack` was 16 entries with a 4-bit `regs_sp`. The uPD96050's call stack is
 8 deep; 16 was arbitrary on my part and cost a 16-entry x 14-bit mux on
@@ -205,20 +205,22 @@ every read -- `pc_next` selects from it combinationally for RT, and
 `regs_sp<0>` was the endpoint of the worst-failing CLK21 path on the mk2
 XC3S400 (-9.855 ns against a 10.412 ns budget).
 
-Now 8 entries, `regs_sp` 3 bits. Firmware that nests calls deeper than 8
-would behave differently -- but so would real hardware, which wraps at 8,
-so this is closer to the chip rather than further from it.
+REVERTED. Mesen-S uses `_stackSize = 8` for ST010/ST011, but ares allocates
+16 for every uPD7725/uPD96050 revision, so the two references disagree on
+this. The error is asymmetric: a stack DEEPER than hardware is harmless,
+while one SHALLOWER silently corrupts return addresses on deep nesting --
+which would present as "works for a while, then dies on a specific call
+chain". Back to 16 entries / 4-bit `regs_sp`, and the savestate scan window
+back to 0x34-0x53.
 
-The savestate scan window moved with it: 0x34-0x53 (16 entries x 2 bytes)
--> 0x34-0x43 (8 x 2). Left at the old size, scan addresses in the upper
-half would alias onto entries 0-7 through the now-3-bit index and corrupt
-them on a write. This core never takes savestates -- savestate.c gates
-dsp_ok on fpga_conf == FPGA_DSP -- but a latent aliasing write is not
-worth leaving in.
+The timing margin the reduction was bought for is no longer needed: mk2
+meets TS_CLK21 at 80% slice occupancy after the savestate and ctx removals.
 
-Note this is one of two levers identified from the mk2 timing report; the
-other, removing the savestate scan port entirely, is untouched. See the
-timing notes above.
+An attempt to measure the firmware's true maximum call depth from the
+gameplay trace was inconclusive -- naive CALL/RET counting does not balance
+(the firmware appears to leave subroutines via JMPSO), giving an absurd
+depth. If someone wants to settle it properly, that measurement needs to
+follow the stack pointer rather than count mnemonics.
 
 ## Savestate scan port disabled
 
@@ -374,9 +376,20 @@ words at low addresses, so its cache never thrashes and the buffer has
 nothing to contribute there. Demonstrating the benefit needs a test whose
 hot loop sits above the prewarm range.
 
-## KNOWN ISSUE (read before flashing)
+## (RESOLVED) write-invalidate bug -- kept for the record
 
-`extpgm_tb` has TWO FAILING CASES with the loop buffer enabled: after a
+The issue described below is FIXED. `lb_wr` is a one-shot raised by
+lb_insert and consumed by the generate block next cycle, so it must be
+cleared unconditionally every cycle. Its default assignment had been placed
+next to `psram_rrq <= 1'b0`, which sits inside the `PGM_IN_PSRAM` branch and
+therefore never executes on the Bus 2 SRAM path this design uses. `lb_wr`
+latched high for the whole firmware-write sequence, and the stale pre-write
+word was re-inserted the moment `wr_busy` dropped. The default now lives on
+the SRAM path. extpgm_tb passes in full.
+
+### original description
+
+`extpgm_tb` had TWO FAILING CASES with the loop buffer enabled: after a
 firmware write to an address, a refetch of that address can return the
 stale pre-write word. A stale entry survives the write-invalidate and the
 buffer serves it instead of the fresh word. Bypassing the buffer in the
@@ -398,3 +411,123 @@ Instead bypass it in the two places it is read:
     assign dout  = (pc_last_done == pc) ? dout_r : cache_rdata;
 
 That reproduces the previous package's behaviour exactly.
+
+
+## Why the loop buffer is the right fix (measured)
+
+From a full 56.5 GB / 1.449 billion instruction gameplay trace:
+
+```
+real-time windows                            128,988
+  executing above word 4095                        0
+distinct words per window       4: 128,932    7: 56
+minimum host-access gap                            8 instructions
+high-address execution (word > 4095)      19,795,689
+  landing on cache entries 0-1023 (the hot region)  7,513,442  (38%)
+```
+
+The transfer loops never leave the prewarmed region -- so the buffer is NOT
+about covering high addresses, which was the original (wrong) justification.
+Its value is EVICTION IMMUNITY. Rarely-executed high code aliases onto the
+hot entries and evicts them:
+
+```
+evictions of entries 242-247 (outbound loop w243-246) : 75,560
+evictions of entries   0-  3 (idle / command entry)   : 64,306
+evictions of entries 196-200 (inbound loop w197-200)  :    216
+   words 12484-12488 alias exactly onto entries 196-200
+```
+
+A command runs high code -> the transfer loop's cache entries are evicted ->
+the next transfer enters cold -> each refetch costs 31 cycles inside a 372ns
+byte slot -> a byte is dropped -> the loop counter never reaches zero ->
+freeze. Rare, because eviction and transfer have to coincide.
+
+Once the loop's words are in the buffer they stay: inserts only happen on
+demand fetches, and a resident loop stops generating them. That is immunity
+from exactly this mechanism.
+
+CACHE_BITS stays 12 on BOTH targets, deliberately, to keep mk2 and mk3
+identical. CACHE_BITS=13 would cut hot-region evictions from 7.5M to 1.87M
+but only fits mk3, and divergence is not worth that here now that the buffer
+addresses the mechanism directly.
+
+## OV1 / S1 semantics corrected (confirmed against three emulators)
+
+STATUS: FIXED. ares, Mesen-S and MesenCE all implement the same rule and
+this core now matches it.
+
+The core previously implemented nocash's earlier description of the uPD7725 overflow
+flags -- "S1 = sign on overflow, OV1 = toggle on overflow" -- which the
+NESdev uPD7725 overflow thread establishes is wrong, and which nocash
+himself conceded there. The correct rule is AWJ's truth table, which higan
+and MAME converged on:
+
+    if(!ov1) s1 = s0;                          // BEFORE ov1 is recalculated
+    ov1 = (ov0 & ov1) ? (s0 == s1) : (ov0 | ov1);
+
+CONFIRMED against both emulator sources, not just the forum thread:
+
+  ares  component/processor/upd96050/instructions.cpp, execOP():
+      flag.s0 = r & 0x8000;
+      if(!flag.ov1) flag.s1 = flag.s0;
+      ...
+      flag.ov1 = flag.ov0 & flag.ov1 ? flag.s0 == flag.s1
+                                     : flag.ov0 | flag.ov1;
+
+  Mesen-S  Core/NecDsp.cpp, RunApuOp():
+      flags.Sign0 = (result & 0x8000) >> 15;
+      if(!flags.Overflow1) { flags.Sign1 = flags.Sign0; }
+      ...
+      if(flags.Overflow0 && flags.Overflow1) {
+        flags.Overflow1 = flags.Sign0 == flags.Sign1;
+      } else { flags.Overflow1 |= flags.Overflow0; }
+
+In both, the S1 guard sits BEFORE the per-ALU switch, so it applies to the
+logical/shift ops as well -- which is the third correction made here.
+
+Three differences from what was implemented:
+
+  * S1 updates when the OLD OV1 is clear, regardless of whether OV0 is set.
+    Previously it updated only on overflow.
+  * Two overflows in the SAME direction must leave OV1 SET. A plain toggle
+    clears it. This is the case the thread singles out -- the chip has to
+    distinguish same-direction from opposite-direction overflows to report
+    the right state after three operations.
+  * Logical/shift ops must also respect the `if(!ov1)` guard on S1. S1 is
+    "direction of last overflow" and has to survive ops that cannot
+    overflow; it was being overwritten unconditionally.
+
+Why this matters here: S1 is read by JSA0 / JSB0 / JNSB0, which the ST011
+firmware executes ~167,000 times in the full gameplay trace, essentially all
+of it in the high-address code that runs during move processing. A wrong S1
+sends those branches the wrong way in rarely-exercised code -- which matches
+a freeze that appears after a few moves rather than immediately, and that no
+testbench here would have caught.
+
+`sim/flags_tb.v` covers it: same-direction overflows, opposite-direction,
+three in a row, non-overflowing ops preserving S1, S1 tracking sign while
+OV1 is clear, plus 2000 randomised steps against the reference.
+
+
+### A wrong revert, recorded
+
+This fix was briefly reverted because a scan of the MesenCE trace appeared
+to show a plain toggle (1,887 of 1,888 disputed cases). That scan was wrong.
+MesenCE's own source has the same rule as ares and Mesen-S:
+
+```
+Core/SNES/Coprocessors/DSP/NecDsp.cpp
+  347  if(!flags.Overflow1) { flags.Sign1 = flags.Sign0; }
+  373  if(flags.Overflow0 && flags.Overflow1) {
+  374      flags.Overflow1 = flags.Sign0 == flags.Sign1;
+  376  } else { flags.Overflow1 |= flags.Overflow0; }
+```
+
+and its trace flag string is C Z V(ov0) V(ov1) N(s0) N(s1)
+(NecDspTraceLogger.cpp:53) -- exactly the layout the scan assumed, so layout
+was not the error. The cause of the bad scan result was never identified.
+
+Lesson: the scan inferred op type and accumulator select from trace text
+rather than decoding opcodes. A correct version must decode each PC's opcode
+from st011.rom and filter to ALU 4-9. Source beats inference.

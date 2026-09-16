@@ -515,6 +515,19 @@ module upd77c25_extpgm (
                        == pc[13:CACHE_BITS]);                   // tag
 
   reg [13:0] pc_r;          // pc the in-flight (or most recent) read is for
+
+  // ---- CACHE PINNING ----------------------------------------------------
+  // Words above 2^CACHE_BITS-1 alias into the direct-mapped cache. When such
+  // a word lands on a slot holding real-time transfer code, the next DMA
+  // transfer takes an external fetch on its first pass and overruns DR
+  // (replay_timed_tb: ST011 words 12485..12490 evict slots 197..202, then
+  // the following inbound transfer drops a byte -> the capture freeze).
+  // Every word executed inside a DMA-paced window in the MesenCE trace is
+  // below 256, so high words may not overwrite slots 0..PIN_WORDS-1. They
+  // still land in the loop buffer. Prewarm and PGM_WR invalidation are not
+  // affected (prewarm only fills low words).
+  parameter PIN_WORDS = 256;
+  wire fill_pinned = (pc_r[13:CACHE_BITS] != 0) && (pc_r[CACHE_BITS-1:0] < PIN_WORDS);
   reg [13:0] pc_last_done = 14'h3fff; // "never fetched" sentinel;
                                        // guaranteed mismatch vs pc=0
   reg [23:0] dout_r;        // last completed demand fetch
@@ -685,7 +698,6 @@ module upd77c25_extpgm (
         else init_addr <= init_addr + 1'b1;
       end
       psram_rrq <= 1'b0;
-    lb_wr <= 1'b0;
       if(cache_ready)
       case(pstate)
         P_IDLE: begin
@@ -719,9 +731,9 @@ module upd77c25_extpgm (
             // path uses, so the CPU sees the same instruction either way
             dout_r <= {pword0[7:0], pword0[15:8], psram_din[7:0]};
             lb_insert(pc_r, {pword0[7:0], pword0[15:8], psram_din[7:0]});
-            lo_we = 1'b1; lo_addr = pc_r[CACHE_BITS-1:0];
+            lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
             lo_data = {pc_r[13:CACHE_BITS], pword0[15:8], psram_din[7:0]};
-            hi_we = 1'b1; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, pword0[7:0]};
+            hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, pword0[7:0]};
             pc_last_done <= pc_r;
             pstate <= P_IDLE;
           end
@@ -731,6 +743,15 @@ module upd77c25_extpgm (
 
     end else begin
     // ---- Bus 2 SRAM fetch path (PGM_IN_PSRAM=0) ----
+    // lb_wr is a one-shot: lb_insert raises it, the generate block below
+    // consumes it next cycle. It MUST be cleared unconditionally every
+    // cycle. It was previously defaulted next to psram_rrq, which sits
+    // inside the PGM_IN_PSRAM branch and therefore never runs here -- so
+    // lb_wr latched high for the whole firmware-write sequence and the
+    // stale pre-write word was re-inserted the moment wr_busy dropped.
+    // That is the extpgm_tb write-hazard failure.
+    lb_wr <= 1'b0;
+
 
     // Continuous cache lookup. Issued every cycle, unconditionally, from
     // cache_raddr -- see the CACHE LOOKUP TIMING note above. Read and
@@ -1027,9 +1048,9 @@ module upd77c25_extpgm (
             // READ_VERIFY second pass: this runs 8192 times and a wrong
             // word here is self-correcting, since a cache miss on it
             // later just re-reads from the SRAM.
-            lo_we = 1'b1; lo_addr = pc_r[CACHE_BITS-1:0];
+            lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
             lo_data = {pc_r[13:CACHE_BITS], byte1, ram_data_s2};
-            hi_we = 1'b1; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
+            hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
             verify_pass <= 1'b0;
             if(prewarm_addr == {CACHE_BITS{1'b1}}) begin
               prewarm_active <= 1'b0;
@@ -1062,9 +1083,9 @@ module upd77c25_extpgm (
             dout_r <= {byte0, byte1, ram_data_s2};
             pc_last_done <= pc_r;
             lb_insert(pc_r, {byte0, byte1, ram_data_s2});
-            lo_we = 1'b1; lo_addr = pc_r[CACHE_BITS-1:0];
+            lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
             lo_data = {pc_r[13:CACHE_BITS], byte1, ram_data_s2};
-            hi_we = 1'b1; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
+            hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
             state <= S_IDLE;
           end else if(!verify_pass) begin
             // First read of this word: stash it and read the same word
@@ -1077,9 +1098,9 @@ module upd77c25_extpgm (
             dout_r <= rd_word_a;
             pc_last_done <= pc_r;
             lb_insert(pc_r, rd_word_a);
-            lo_we = 1'b1; lo_addr = pc_r[CACHE_BITS-1:0];
+            lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
             lo_data = {pc_r[13:CACHE_BITS], rd_word_a[15:0]};
-            hi_we = 1'b1; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, rd_word_a[23:16]};
+            hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, rd_word_a[23:16]};
             verify_pass <= 1'b0;
             state <= S_IDLE;
           end else if(retry_cnt >= MAX_RETRY) begin
@@ -1090,9 +1111,9 @@ module upd77c25_extpgm (
             dout_r <= {byte0, byte1, ram_data_s2};
             pc_last_done <= pc_r;
             lb_insert(pc_r, {byte0, byte1, ram_data_s2});
-            lo_we = 1'b1; lo_addr = pc_r[CACHE_BITS-1:0];
+            lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
             lo_data = {pc_r[13:CACHE_BITS], byte1, ram_data_s2};
-            hi_we = 1'b1; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
+            hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
             verify_pass <= 1'b0;
             retry_cnt <= 3'd0;
             state <= S_IDLE;

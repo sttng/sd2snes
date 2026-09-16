@@ -356,7 +356,7 @@ reg [15:0] regs_si;   // serial input; read-only from the instruction set's
                        // command dispatch is a JMPSO through a data-ROM
                        // jump table (trace: word 19), so this register is
                        // load-bearing -- do not optimise it away.
-reg [2:0] regs_sp;
+reg [3:0] regs_sp;
 
 reg cond_true;
 
@@ -375,11 +375,15 @@ wire [13:0] jp_target = {jp_page_bit, jp_bank, jp_na};
 // Declared here rather than with the other register file entries: the
 // pc_next expression below reads it, and ISE requires declaration
 // before use even though Icarus does not.
-// 8 entries, matching the uPD96050's actual call stack depth. It was 16,
-// which was arbitrary -- the extra depth cost a 16-entry mux on every read,
-// and regs_sp<0> was the endpoint of the worst-failing CLK21 path on the
-// mk2 XC3S400 (-9.855 ns). Real hardware wraps at 8; deeper never helped.
-reg [13:0] stack [7:0];
+// 16 entries. This was briefly cut to 8 to shrink the mux feeding regs_sp,
+// on the strength of Mesen-S using _stackSize = 8 for ST010/ST011. That was
+// the wrong call: ares allocates 16 for every uPD7725/uPD96050 revision, so
+// the two references disagree, and the error is ASYMMETRIC -- a stack
+// deeper than hardware is harmless, while one shallower silently corrupts
+// return addresses on deep nesting. Reverted, and the timing margin it was
+// bought for is no longer needed (mk2 meets TS_CLK21 at 80% occupancy after
+// the savestate/ctx removals).
+reg [13:0] stack [15:0];
 
 // stack[regs_sp-1], registered. pc_next reads the stack top for RT, and
 // PC_LOOKAHEAD publishes pc_next straight into the fetch unit's cache
@@ -488,7 +492,7 @@ assign ss_halted = ss_frozen;
 
 // $600-$6FF register-file window (live only once actually frozen)
 assign ss_regwin = ss_window_en & DP_enable & ss_frozen & (DP_ADDR[10:8] == 3'b110);
-wire [2:0] ss_stk_idx = (DP_ADDR[7:0] - 8'h34) >> 1;
+wire [3:0] ss_stk_idx = (DP_ADDR[7:0] - 8'h34) >> 1;
 reg [7:0] ss_reg_do;
 // Read the arrays through scalar wires so the combinational readback mux below reads
 // scalars, not 2D arrays -- XST (mk2) rejects a memory array in an @(*) sensitivity list
@@ -497,10 +501,8 @@ wire [15:0] ss_rab0 = regs_ab[0];
 wire [15:0] ss_rab1 = regs_ab[1];
 wire [13:0] ss_stk  = stack[ss_stk_idx];
 always @(*) begin
-  // Window narrowed 0x34-0x53 -> 0x34-0x43 with the stack: 8 entries x 2
-  // bytes. Left as-is, the upper half would alias onto entries 0-7 through
-  // the now-3-bit index and corrupt them on a scan write.
-  if (DP_ADDR[7:0] >= 8'h34 && DP_ADDR[7:0] <= 8'h43)
+  // Window is 0x34-0x53: 16 entries x 2 bytes, matching the stack depth.
+  if (DP_ADDR[7:0] >= 8'h34 && DP_ADDR[7:0] <= 8'h53)
     ss_reg_do = DP_ADDR[0] ? {2'b0, ss_stk[13:8]}
                            : ss_stk[7:0];
   else case (DP_ADDR[7:0])
@@ -530,7 +532,7 @@ always @(*) begin
     8'h17: ss_reg_do = regs_n[15:8];
     8'h18: ss_reg_do = {regs_dph, regs_dpl};
     8'h19: ss_reg_do = {5'b0, regs_dpb};
-    8'h1a: ss_reg_do = {5'b0, regs_sp};
+    8'h1a: ss_reg_do = {4'b0, regs_sp};
     8'h1b: ss_reg_do = insn_state;
     8'h1c: ss_reg_do = {2'b0, updFL_A};
     8'h1d: ss_reg_do = {2'b0, updFL_B};
@@ -568,7 +570,7 @@ end
 initial begin
   alu_store = 2'b11;
   insn_state = STATE_IDLE1;
-  regs_sp = 3'b000;
+  regs_sp = 4'b0000;
   pc = 14'b0;
   regs_sr = 16'b0;
   regs_rp = 16'h0000;
@@ -703,36 +705,60 @@ always @(posedge CLK) begin
             flags_s0[op_asl] <= alu_r[15];
           end
           case(op_alu)
-            // OR, AND, XOR, NOT, SAR1, RCL1, SLL2, SLL4, XCHG: per nocash's
-            // documented table (verified against real silicon via no$sns),
-            // S1=sf UNCONDITIONALLY (not gated on old OV1 -- these ops
-            // never overflow, so S1 simply always tracks the new sign),
-            // OV1=0 and OV0=0 unconditionally. Cy=0 except SAR1/RCL1,
-            // which carry the shifted-out bit.
+            // Logical/shift ops: OV0=0, OV1=0, S1 = new sign. Cy=0 except
+            // SAR1/RCL1, which carry the shifted-out bit.
+            //
+            // ---- OV1 / S1 semantics -------------------------------
+            // ares, Mesen-S and MesenCE all implement the same rule, and
+            // this code matches it:
+            //     if(!ov1) s1 = s0;       // before the per-ALU switch
+            //     ov1 = (ov0 & ov1) ? (s0 == s1) : (ov0 | ov1);
+            //   ares    component/processor/upd96050/instructions.cpp
+            //   Mesen-S Core/NecDsp.cpp
+            //   MesenCE Core/SNES/Coprocessors/DSP/NecDsp.cpp:347,373
+            // Two overflows in the SAME direction leave OV1 SET; a plain
+            // toggle (this core's original behaviour, from nocash's earlier
+            // description) clears it instead. The `if(!ov1)` guard sits
+            // BEFORE the per-ALU switch in all three, so it applies to the
+            // logical/shift ops here as well.
+            //
+            // HISTORY: a scan of the MesenCE trace appeared to contradict
+            // this (1,887 of 1,888 disputed cases looked like a toggle) and
+            // the fix was briefly reverted on that basis. The scan was
+            // WRONG -- the trace flag string really is
+            // C Z V(ov0) V(ov1) N(s0) N(s1) per NecDspTraceLogger.cpp:53,
+            // so layout was not the error and the cause was never found.
+            // Trust the three sources. A correct rescan must decode the
+            // opcode at each PC and filter to ALU 4-9 rather than treating
+            // every flag-string change as an arithmetic op.
             4'b0001, 4'b0010, 4'b0011, 4'b1010, 4'b1101, 4'b1110, 4'b1111: begin
               flags_c[op_asl] <= 0;
               flags_ov0[op_asl] <= 0;
               flags_ov1[op_asl] <= 0;
-              flags_s1[op_asl] <= alu_r[15];
+              // guarded on the OLD OV1, exactly as in the arithmetic case:
+              // S1 is "direction of last overflow" and must survive an op
+              // that cannot overflow.
+              if(!flags_ov1[op_asl]) flags_s1[op_asl] <= alu_r[15];
             end
             4'b1011: begin  // SAR1
               flags_c[op_asl] <= alu_q[0];
               flags_ov0[op_asl] <= 0;
               flags_ov1[op_asl] <= 0;
-              flags_s1[op_asl] <= alu_r[15];
+              // guarded on the OLD OV1, exactly as in the arithmetic case:
+              // S1 is "direction of last overflow" and must survive an op
+              // that cannot overflow.
+              if(!flags_ov1[op_asl]) flags_s1[op_asl] <= alu_r[15];
             end
             4'b1100: begin  // RCL1
               flags_c[op_asl] <= alu_q[15];
               flags_ov0[op_asl] <= 0;
               flags_ov1[op_asl] <= 0;
-              flags_s1[op_asl] <= alu_r[15];
+              // guarded on the OLD OV1, exactly as in the arithmetic case:
+              // S1 is "direction of last overflow" and must survive an op
+              // that cannot overflow.
+              if(!flags_ov1[op_asl]) flags_s1[op_asl] <= alu_r[15];
             end
-            // SUB, ADD, SBB, ADC, DEC, INC: per nocash, "S1=sf and OV1=OV1
-            // XOR 1 upon overflow (leave S1 and OV1 both unchanged if no
-            // overflow)". A plain toggle on OV0, not a sign comparison --
-            // verified this produces the documented "skip if 0 or 2
-            // overflows occurred" parity behavior the JOVA1/JNOVA1 opcodes
-            // rely on (checked numerically before implementing this).
+            // SUB, ADD, SBB, ADC, DEC, INC: the rule documented above.
             4'b0100, 4'b0101, 4'b0110, 4'b0111, 4'b1000, 4'b1001: begin
               if(op_alu[0]) begin
                 flags_c[op_asl] <= (alu_r < alu_q);
@@ -740,11 +766,13 @@ always @(posedge CLK) begin
                 flags_c[op_asl] <= (alu_r > alu_q);
               end
               flags_ov0[op_asl] <= alu_ov0_arith;
-              if(alu_ov0_arith) begin
-                flags_s1[op_asl] <= alu_r[15];
-                flags_ov1[op_asl] <= ~flags_ov1[op_asl];
-              end
-              // else: s1 and ov1 both stay unchanged (no assignment)
+              // S1 first (using the OLD OV1), then OV1 (using the OLD S1).
+              // They never conflict: S1 only changes when OV1 was clear, and
+              // OV1 only depends on S1 when OV1 was set.
+              if(!flags_ov1[op_asl]) flags_s1[op_asl] <= alu_r[15];
+              flags_ov1[op_asl] <= (alu_ov0_arith & flags_ov1[op_asl])
+                                 ? (alu_r[15] == flags_s1[op_asl])
+                                 : (alu_ov0_arith | flags_ov1[op_asl]);
             end
           endcase
         end
@@ -1026,7 +1054,7 @@ always @(posedge CLK) begin
     // regs_dr and regs_sr bits 15/12 are restored in their own blocks below;
     // everything else is here. Mirrors the read mux offset map exactly.
     if(ss_regwin & reg_we_rising) begin
-      if(DP_ADDR[7:0] >= 8'h34 && DP_ADDR[7:0] <= 8'h43) begin
+      if(DP_ADDR[7:0] >= 8'h34 && DP_ADDR[7:0] <= 8'h53) begin
         if(DP_ADDR[0]) stack[ss_stk_idx][13:8] <= DI[5:0];
         else           stack[ss_stk_idx][7:0]  <= DI;
       end else case(DP_ADDR[7:0])
@@ -1056,7 +1084,7 @@ always @(posedge CLK) begin
         8'h17: regs_n[15:8]     <= DI;
         8'h18: begin regs_dph <= DI[7:4]; regs_dpl <= DI[3:0]; end
         8'h19: regs_dpb <= DI[2:0];
-        8'h1a: regs_sp  <= DI[2:0];
+        8'h1a: regs_sp  <= DI[3:0];
         8'h1b: insn_state <= DI;
         8'h1c: begin flags_s1[0] <= DI[5]; flags_s0[0] <= DI[4]; flags_c[0] <= DI[3];
                      flags_z[0] <= DI[2]; flags_ov1[0] <= DI[1]; flags_ov0[0] <= DI[0]; end
@@ -1093,7 +1121,7 @@ always @(posedge CLK) begin
   end else begin
     insn_state <= STATE_IDLE1;
     pc <= 14'b0;
-    regs_sp <= 3'b000;
+    regs_sp <= 4'b0000;
     cond_true <= 0;
     regs_sr[14] <= 0;
     regs_sr[13] <= 0;
