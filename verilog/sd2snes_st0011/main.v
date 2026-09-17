@@ -155,24 +155,10 @@ wire dspx_ss_halt;
 wire dspx_ss_halted;
 
 // ---------------------------------------------------------------------------
-// Savestate scan port: DISABLED in this core.
-//
-// The scan overlay in upd77c25.v (the $68-$6F:x6xx register window, the
-// boundary-gated freeze, the stack/accumulator readout mux) exists for
-// DSP1-4. ST011 never uses it: savestate.c gates dsp_ok on
-// fpga_conf == FPGA_DSP, and this core is loaded as FPGA_ST0011.
-//
-// It was gated on featurebits[0] (FEAT_DSPX), a RUNTIME signal, so synthesis
-// could not prune it even though the bit is always 0 here -- the whole
-// overlay was being built and placed. It was also on the worst-failing
-// CLK21 path on the mk2 XC3S400: SNES_ADDR_4 -> ss_reg_do_cmp_ge0000 ->
-// ss_reg_do_and0000 -> stack -> regs_sp, -9.855 ns.
-//
-// Tied to constants rather than deleted from upd77c25.v: the ss_* logic is
-// interlocked (ss_ctrl / ss_regwin / ss_frozen / ram_wea / ram_web all
-// reference it) and cutting it out by hand risks changing the data-RAM
-// window, which the SNES DOES use. Constant-folding gets the same result
-// with no chance of breaking the live path.
+// Savestate scan port: disabled in this core (ST011 never takes savestates;
+// savestate.c requires FPGA_DSP). Tied to constants rather than deleted from
+// upd77c25.v because the ss_* signals are referenced by the data RAM write
+// path; constant folding removes the overlay and leaves that path unchanged.
 // ---------------------------------------------------------------------------
 wire dspx_ss_window_en = 1'b0;
 wire dspx_ext_pgm_en = featurebits[1]; // FEAT_ST0010: fetch program from external Bus 2 SRAM
@@ -409,9 +395,9 @@ parameter ST_DMA_RD_ADDR = 13'b0000010000000;
 parameter ST_DMA_RD_END  = 13'b0000100000000;
 parameter ST_DMA_WR_ADDR = 13'b0001000000000;
 parameter ST_DMA_WR_END  = 13'b0010000000000;
-// DSP program fetch from PSRAM (ST011). Lowest priority of all
-// requesters and gated by free_slot like the rest, so the SNES is never
-// delayed by a DSP fetch.
+// DSP program fetch from PSRAM. Only used by the unfinished PGM_IN_PSRAM
+// path in upd77c25_extpgm.v (disabled); the ST011 program is fetched from
+// the Bus 2 SRAM.
 parameter ST_DSP_RD_ADDR = 13'b0100000000000;
 parameter ST_DSP_RD_END  = 13'b1000000000000;
 
@@ -448,18 +434,9 @@ sd_dma snes_sd_dma(
 assign SD_DMA_TO_ROM = (SD_DMA_STATUS && (SD_DMA_TGT == 2'b00));
 
 // ---------------------------------------------------------------------------
-// The MSU-1 audio DAC is not instantiated in this core.
-//
-// dac_buf costs 1 BRAM on the mk2 XC3S400 and 2 M9K on mk3, and it is dead
-// weight here: its only source is MSU-1 audio, which this core does not
-// have. On mk2 that block is the difference between 16 of 16 and 15 of 16,
-// i.e. between "the fitter might not place it" and a little air.
-//
-// The DAC pins are driven to a defined idle rather than left floating, so
-// the external DAC sees a static, silent input instead of an undriven bus.
-// mcu_cmd.v's DAC registers stay wired up -- it is a shared module and the
-// unreachable logic is pruned by synthesis -- so only DAC_STATUS, which the
-// dac module used to drive, is tied off.
+// MSU-1 audio DAC not instantiated (no MSU-1 in this core). The DAC pins are
+// driven to a silent idle; DAC_STATUS is tied low. mcu_cmd.v's DAC registers
+// stay and are pruned by synthesis.
 // ---------------------------------------------------------------------------
 assign DAC_MCLK  = 1'b0;
 assign DAC_LRCK  = 1'b0;
@@ -467,18 +444,10 @@ assign DAC_SDOUT = 1'b0;
 assign DAC_STATUS = 1'b0;   // 1-bit, per mcu_cmd.v's port
 
 // ---------------------------------------------------------------------------
-// MSU-1 is not instantiated in this core.
-//
-// It costs 8 BRAM on the mk2 XC3S400 and 16 M9K on mk3, and no ST011
-// cart uses it. Dropping it -- together with upd77c25_pgmrom, which this
-// core never reads because the 16384-word program always comes from the
-// external fetch path -- is what lets the design fit the mk2's 16 BRAMs.
-//
-// The msu_* nets, address.v's msu_enable decode and mcu_cmd.v's MSU
-// registers are all left in place rather than surgically removed: they are
-// shared modules, the MCU never sets FEAT_MSU1 for this core, and synthesis
-// prunes the unreachable logic. Only the buffer and the module itself are
-// gone. The outputs the module used to drive are tied off here.
+// MSU-1 not instantiated: no ST011 cart uses it, and its 8 RAMB16 / 16 M9K
+// are needed on mk2. The msu_* nets, address.v's msu_enable decode and
+// mcu_cmd.v's MSU registers remain (shared modules, pruned by synthesis);
+// the module's outputs are tied off here.
 // ---------------------------------------------------------------------------
 assign MSU_SNES_DATA_OUT = 8'h00;
 assign msu_status_out = 8'h00;
@@ -493,17 +462,8 @@ wire [23:0] CTX_ADDR;
 wire [15:0] CTX_DOUT;
 
 // ---------------------------------------------------------------------------
-// Savestate context capture (ctx.v) is NOT instantiated in this core.
-//
-// ctx.v snoops the SNES bus continuously to capture CPU/PPU state for
-// savestates. This core never takes savestates -- savestate.c gates dsp_ok
-// on fpga_conf == FPGA_DSP and this loads as FPGA_ST0011 -- so it was live
-// logic that can never be reached, in a design running at 89% slice
-// occupancy with TS_CLK21 unmet.
-//
-// Its OE_*_ENABLE outputs are connected nowhere else in main.v, so the only
-// real consumers are the PSRAM arbiter ports, tied off here. CTX_RDY is an
-// arbiter output that simply goes unread now.
+// Savestate context capture (ctx.v) not instantiated (no savestates for
+// ST011). Its PSRAM arbiter request ports are tied off; CTX_RDY goes unread.
 // ---------------------------------------------------------------------------
 assign CTX_WRQ  = 1'b0;
 assign CTX_ADDR = 24'h000000;

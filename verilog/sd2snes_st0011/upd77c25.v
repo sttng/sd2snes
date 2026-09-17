@@ -8,7 +8,7 @@
 // Project Name: sd2snes
 // Target Devices: xc3s400
 // Tool versions: ISE 13.1
-// Description: NEC uPD77C25 core (for SNES DSP1-4)
+// Description: NEC uPD96050 core for ST011 (derived from the uPD77C25 DSP1-4 core)
 //
 // Dependencies:
 //
@@ -59,7 +59,7 @@ module upd77c25(
   output RAM_OE,
   output RAM_WE,
 
-  // savestate scan port (Phase 1: read-only)
+  // savestate scan port -- inert here: main.v ties ss_halt/ss_window_en to 0
   input ss_halt,        // MCU debug halt request
   input ss_window_en,   // 1 = DSP1-4 (scan overlay active); 0 = uPD96050 (plain RAM)
   output ss_halted,     // 1 = freeze in effect, safe to snapshot/restore
@@ -108,12 +108,9 @@ parameter PREWARM_ENABLE = 1;
 // See the LOOP BUFFER note in upd77c25_extpgm.v.
 parameter LOOPBUF_ENTRIES = 8;
 
-// Passed through to upd77c25_extpgm. 1 reads every MISSED word twice and
-// commits only on agreement; 0 reads it once. 0 halves the cost of a
-// cache miss (60.5 -> 31.0 cycles at 96MHz) and is the setting ST011
-// needs -- see that module's READ_VERIFY comment for the measurements
-// and for why the SRAM-integrity hypothesis it was built to test is no
-// longer live.
+// Passed through to upd77c25_extpgm. 1 reads every missed word twice and
+// commits only on agreement. Keep 0: it doubles the cost of a cache miss
+// (31 -> 60.5 cycles at 96MHz) for no benefit.
 parameter READ_VERIFY = 0;
 
 parameter I_OP = 2'b00;
@@ -150,39 +147,25 @@ assign ram_dina = ram_dina_r;
 
 
 
-// External program fetch -- the only program source in this core. ST011
-// firmware is 16384 24-bit words, far past anything that fits on-chip, so
-// it lives in the board's separate, otherwise-unused Bus 2 SRAM
-// (RAM_ADDR/RAM_DATA/RAM_OE/RAM_WE), addressed byte-wise (3 bytes per
-// instruction). The 2048-word on-chip pgmrom that serves DSP1-4 in the
-// shared core is not instantiated here. See upd77c25_extpgm.v.
+// External program fetch -- the only program source in this core: 16384
+// 24-bit words in the Bus 2 SRAM, 3 bytes per word. See upd77c25_extpgm.v.
 wire [23:0] ext_pgm_dout;
 wire ext_pgm_ready;
 wire ext_pgm_busy_wr;
 
 // ---- THROUGHPUT (ST011) ------------------------------------------------
 //
-// ST011 talks to the SNES entirely through DR/SR, and it does so on a
-// DMA-paced schedule with no handshake. The reference execution trace shows
-// a host access to DR every 8 DSP instructions -- 309 of 399 gaps are
-// exactly 8, and none is ever less -- while the DSP's transfer loops
-// (words 197-200 in, 243-246 out) are 4 instructions long. So the core
-// must sustain at least one instruction per two host-access-eighths, or
-// DR is overwritten before it is consumed; the loop counter then never
-// reaches zero and the DSP parks in JRQM forever, which is exactly the
-// hang this core exhibited.
+// ST011 moves bulk data through DR by DMA, with no handshake: a byte lands
+// every ~370 ns (8-9 cycles of Mesen's 22 MHz DSP clock) whether or not the
+// previous one was consumed. The transfer loops (words 197-200 in, 243-247
+// out) are 4 instructions per byte. If a byte is not consumed in time it is
+// overwritten, the loop counter never reaches zero and the DSP waits in
+// JRQM forever.
 //
-// At 96MHz the budget is about 4.5 cycles per instruction. The state
-// sequence below was seven states plus a three-cycle external-fetch stall
-// = ten cycles, i.e. 2.5x too slow, and no cpu_wait value could fix that
-// because cpu_wait only ever makes it slower. Two changes bring it to
-// six: SKIP_ALU2 removes a state that did nothing, and pc_next is
-// published to the fetch unit a cycle early so a cache hit costs zero
-// stall cycles. See upd77c25_extpgm.v's CACHE LOOKUP TIMING note.
-//
-// ST010 is unaffected either way: it communicates through its data RAM
-// window and barely touches DR at all, which is also why it kept working
-// throughout while ST011 never did.
+// At 96MHz a cached instruction takes 6 cycles (62.5 ns), about 6 per byte
+// slot. SKIP_ALU2 and PC_LOOKAHEAD are what get it there. An external fetch
+// costs ~31 cycles, i.e. a whole slot, so the transfer code must never miss:
+// see PREWARM and CACHE PINNING in upd77c25_extpgm.v.
 wire [13:0] pc_next;        // combinational next-pc, valid in STATE_STORE
 wire pc_early_valid;
 
@@ -215,29 +198,16 @@ upd77c25_extpgm #(.PREWARM_ENABLE(PREWARM_ENABLE),
   .RAM_WE(RAM_WE)
 );
 
-// Program source. ext_pgm_en (FEAT_ST0011) selects the external fetch
-// path; pgm_doutb is the on-chip 2048-word ROM.
+// Program source. The 2048-word on-chip program ROM is not instantiated:
+// the ST011 program is 16384 words and always comes from the external fetch
+// path (upd77c25_extpgm.v).
 //
-// The on-chip ROM was removed from this core at one point, on the grounds
-// that a dedicated ST011 core never reads it and its 3 BRAM / 6 M9K are
-// the difference between fitting the mk2 and not. It is back: with it
-// gone there is no opcode source at all whenever ext_pgm_en is low, which
-// includes the window between FPGA configuration and the MCU's feature
-// write. Restoring it costs the blocks but removes a whole class of
-// reset-ordering hazard, and mk2 still fits (15 of 16).
-// The 2048-word on-chip program ROM is not instantiated. This core is
-// ST011-only: the program is 16384 words, always comes from the external
-// fetch path, and pgmrom would be dead RAM -- 4 RAMB16 on the mk2 XC3S400
-// and 6 M9K on mk3.
-//
-// Removing it means there is no fallback opcode source when ext_pgm_en is
-// low. That is safe as the design stands, because mcu_cmd.v powers up with
-// dspx_reset_out = 1 and main.v wires .RST(~dspx_reset), so the core is held
-// in reset until the MCU releases it -- after both the feature write and the
-// firmware load. The cold-start gates below additionally require ext_pgm_en
-// to be HIGH (rather than treating "disabled" as "ready"), so if that reset
-// ordering is ever changed the core stalls instead of executing whatever
-// ext_pgm_dout happens to hold.
+// There is therefore no opcode source while ext_pgm_en is low. That is safe
+// because mcu_cmd.v powers up with dspx_reset_out = 1 and main.v wires
+// .RST(~dspx_reset), so the core stays in reset until the MCU has written
+// the feature bits and loaded the firmware. The cold-start gates below also
+// require ext_pgm_en & ext_pgm_ready, so if that ordering ever changes the
+// core stalls at pc=0 instead of executing garbage.
 wire [23:0] opcode_w = ext_pgm_dout;
 reg [1:0] op;
 reg [1:0] op_pselect;
@@ -250,14 +220,9 @@ reg [3:0] op_src;
 reg [3:0] op_dst;
 
 wire [15:0] dat_doutb;
-// Corrects the same byte-order mismatch as program ROM (ares's dump
-// format is little-endian, this loader's assembly path is big-endian --
-// see upd77c25_extpgm.v's header comment for the full derivation),
-// confirmed numerically against the actual firmware dump: every
-// asymmetric data-ROM word arrives as {true[7:0], true[15:8]} instead of
-// true. Data ROM's on-chip storage doesn't transform bytes at all (unlike
-// program ROM's 3-byte SRAM serialization), so the correction has to
-// happen here, at the point of consumption, rather than in the write path.
+// The data ROM image arrives byte-swapped relative to the true words
+// (confirmed against the ST011 dump and the MesenCE trace). Data ROM storage
+// does not transform bytes, so the swap is applied here at the point of use.
 wire [15:0] dat_doutb_fixed = {dat_doutb[7:0], dat_doutb[15:8]};
 
 `ifdef MK2
@@ -344,18 +309,11 @@ reg [15:0] regs_trb;
 reg [15:0] regs_tr;
 reg [15:0] regs_dr;
 reg [15:0] regs_sr;
-reg [15:0] regs_so;   // serial output; only meaningful use in this core is
-                       // as JMPSO's jump target (opcode $000). Real serial
-                       // I/O is not implemented, matching ares.
-reg [15:0] regs_si;   // serial input; read-only from the instruction set's
-                       // perspective (no dst opcode ever writes it -- real
-                       // hardware fills it from external serial traffic).
-                       // Real serial I/O isn't implemented (matching ares),
-                       // but SO is NOT dead: destinations 8 and 9 (SOL/SOM)
-                       // write it, and JMPSO jumps to it. ST011's entire
-                       // command dispatch is a JMPSO through a data-ROM
-                       // jump table (trace: word 19), so this register is
-                       // load-bearing -- do not optimise it away.
+reg [15:0] regs_so;   // serial output. Serial I/O is not implemented (as in
+                       // ares), but SO is load-bearing: SOL/SOM write it and
+                       // JMPSO jumps to it -- ST011's command dispatch is a
+                       // JMPSO through a data-ROM table (word 19).
+reg [15:0] regs_si;   // serial input; never written by any instruction.
 reg [3:0] regs_sp;
 
 reg cond_true;
@@ -375,19 +333,13 @@ wire [13:0] jp_target = {jp_page_bit, jp_bank, jp_na};
 // Declared here rather than with the other register file entries: the
 // pc_next expression below reads it, and ISE requires declaration
 // before use even though Icarus does not.
-// 16 entries. This was briefly cut to 8 to shrink the mux feeding regs_sp,
-// on the strength of Mesen-S using _stackSize = 8 for ST010/ST011. That was
-// the wrong call: ares allocates 16 for every uPD7725/uPD96050 revision, so
-// the two references disagree, and the error is ASYMMETRIC -- a stack
-// deeper than hardware is harmless, while one shallower silently corrupts
-// return addresses on deep nesting. Reverted, and the timing margin it was
-// bought for is no longer needed (mk2 meets TS_CLK21 at 80% occupancy after
-// the savestate/ctx removals).
+// 16 entries, as in ares. Mesen-S uses 8; a deeper stack than the chip is
+// harmless, a shallower one silently corrupts return addresses.
 reg [13:0] stack [15:0];
 
 // stack[regs_sp-1], registered. pc_next reads the stack top for RT, and
 // PC_LOOKAHEAD publishes pc_next straight into the fetch unit's cache
-// address -- so the subtract and the 8-entry mux ended up combinationally
+// address -- so the subtract and the 16-entry mux ended up combinationally
 // in front of a block RAM address pin, and became the worst CLK21 path on
 // mk2 once the cache arrays were free to move (-1.341 ns).
 //
@@ -450,17 +402,15 @@ assign updFL_A = {flags_s1[0],flags_s0[0],flags_c[0],flags_z[0],flags_ov1[0],fla
 assign updFL_B = {flags_s1[1],flags_s0[1],flags_c[1],flags_z[1],flags_ov1[1],flags_ov0[1]};
 
 // ---- savestate scan port -------------------------------------------------
-// While halted, every always-block below holds (full freeze). The
-// architectural + pipeline state is then exposed as a flat byte window at
-// DP_ADDR $600-$6FF (port-B gap unused by DSP1, which only touches 256
-// words); $7FF is a halt control byte (write bit0=halt, read bit0=halted).
-// One DMA captures/restores the whole DSP. See offset map below.
-// ss_window_en distinguishes DSP1-4 (overlay active) from the uPD96050, which
-// uses the full 2KB RAM window for the game -> for the uPD96050
-// ss_window_en=0 and the window stays plain RAM (behavior unchanged).
-// Two halt sources: ss_halt (MCU, debug) and ss_halt_snes (savestate handler
-// via $7FF). ss_halt_snes lives in its own block so it stays settable/clearable
-// while everything else is frozen.
+// INERT IN THIS CORE: main.v ties ss_window_en and ss_halt to 0, so
+// ss_ctrl, ss_regwin, ss_halt_eff and ss_frozen fold to 0 and synthesis
+// removes the overlay. It is kept, not deleted, because ram_wea/ram_web and
+// the DO mux reference these signals; with them at 0 the SNES data RAM window
+// at DP_ADDR is plain RAM.
+//
+// (DSP1-4 background: while halted the state is exposed as a byte window at
+// DP_ADDR $600-$6FF, $7FF is a halt control byte; ss_halt_snes is the
+// savestate handler's halt source.)
 reg ss_halt_snes;
 initial ss_halt_snes = 1'b0;
 wire ss_halt_eff = ss_halt | ss_halt_snes;
@@ -666,13 +616,8 @@ always @(posedge CLK) begin
           regs_dr[15:8] <= DI;
         end
       end else begin
-        // 8-bit mode: low byte only, high byte preserved
-        // (`dr = (dr & 0xff00) | data`). The previous form zero-extended
-        // the byte, clearing the high half. It matters for
-        // ST011: the trace shows the firmware clearing DRC and running
-        // DRS-paced 16-bit transfers around words 233-239, then
-        // switching back, so the two modes interleave on live data and
-        // a silently cleared high byte is observable.
+        // 8-bit mode: low byte only, high byte preserved. ST011 mixes
+        // 8-bit and 16-bit (words 233-239) transfers on live data.
         regs_dr[7:0] <= DI;
       end
     end else if(ld_dst == 4'b0110 && insn_state == STATE_STORE) begin
@@ -709,28 +654,12 @@ always @(posedge CLK) begin
             // SAR1/RCL1, which carry the shifted-out bit.
             //
             // ---- OV1 / S1 semantics -------------------------------
-            // ares, Mesen-S and MesenCE all implement the same rule, and
-            // this code matches it:
             //     if(!ov1) s1 = s0;       // before the per-ALU switch
             //     ov1 = (ov0 & ov1) ? (s0 == s1) : (ov0 | ov1);
-            //   ares    component/processor/upd96050/instructions.cpp
-            //   Mesen-S Core/NecDsp.cpp
-            //   MesenCE Core/SNES/Coprocessors/DSP/NecDsp.cpp:347,373
-            // Two overflows in the SAME direction leave OV1 SET; a plain
-            // toggle (this core's original behaviour, from nocash's earlier
-            // description) clears it instead. The `if(!ov1)` guard sits
-            // BEFORE the per-ALU switch in all three, so it applies to the
-            // logical/shift ops here as well.
-            //
-            // HISTORY: a scan of the MesenCE trace appeared to contradict
-            // this (1,887 of 1,888 disputed cases looked like a toggle) and
-            // the fix was briefly reverted on that basis. The scan was
-            // WRONG -- the trace flag string really is
-            // C Z V(ov0) V(ov1) N(s0) N(s1) per NecDspTraceLogger.cpp:53,
-            // so layout was not the error and the cause was never found.
-            // Trust the three sources. A correct rescan must decode the
-            // opcode at each PC and filter to ALU 4-9 rather than treating
-            // every flag-string change as an arithmetic op.
+            // Same rule in ares, Mesen-S and MesenCE, and verified against the full
+            // MesenCE ST011 trace (tools/iss.c, zero mismatches). Two overflows in the
+            // same direction leave OV1 set. The S1 guard also applies to the
+            // logical/shift ops.
             4'b0001, 4'b0010, 4'b0011, 4'b1010, 4'b1101, 4'b1110, 4'b1111: begin
               flags_c[op_asl] <= 0;
               flags_ov0[op_asl] <= 0;
@@ -895,6 +824,9 @@ always @(posedge CLK) begin
             4'b0011: alu_r <= alu_q ^ alu_p;
             4'b0100: alu_r <= alu_q - alu_p;
             4'b0101: alu_r <= alu_q + alu_p;
+            // SBB/ADC/SHL1 take carry from the OTHER accumulator's flags
+            // (verified against the MesenCE trace; same-accumulator carry
+            // mismatches ~17k times).
             4'b0110: alu_r <= alu_q - alu_p - flags_c[~op_asl];
             4'b0111: alu_r <= alu_q + alu_p + flags_c[~op_asl];
             4'b1000: alu_r <= alu_q - alu_p;
@@ -1006,13 +938,8 @@ always @(posedge CLK) begin
 
       STATE_NEXT: begin
         if(~|cpu_wait) begin
-          // cpu_wait has already run out -- for DSP1-4 (ext_pgm_en=0) this
-          // is unconditional, exactly as before. For ST011, hold here
-          // (without further decrementing cpu_wait) until the external
-          // fetch for the new pc has completed; in practice this overlaps
-          // almost entirely with the cpu_wait cycles already being spent
-          // above to throttle the core down to its real clock speed, so it
-          // rarely costs anything extra.
+          // Hold until the external fetch for the new pc is ready (a cache or
+          // loop-buffer hit makes this true on the first cycle).
           if(ext_pgm_en & ext_pgm_ready) insn_state <= STATE_IDLE1;
         end else begin
           insn_state <= STATE_NEXT;
@@ -1130,14 +1057,7 @@ always @(posedge CLK) begin
     regs_sr[9] <= 0;
     regs_sr[8] <= 0;
     regs_sr[7] <= 0;
-    regs_rp <= 11'h000; // matches ares's power(): regs.rp = 0x0000.
-                         // (nocash documents RP=3FFh for the base chip's
-                         // 10-bit RP; extrapolating that to this 11-bit
-                         // register was my own inference and is not
-                         // corroborated by the reference implementation
-                         // that actually runs these games, so it is not
-                         // used here. RP is loaded before use by the
-                         // dispatch code anyway.)
+    regs_rp <= 11'h000; // as ares power(); firmware loads RP before use
     regs_dpb <= 3'b0;
     regs_dph <= 4'b0;
     regs_dpl <= 4'b0;

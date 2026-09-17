@@ -1,83 +1,25 @@
 // upd77c25_extpgm.v
 //
-// External program memory controller for ST011.
+// External program memory for the ST011 uPD96050 core.
 //
-// The on-chip pgmrom (upd77c25_pgmrom, 2048 x 24-bit) only ever holds
-// DSP1-4 firmware -- it's far too small for ST011, whose real
-// firmware can span the full 16384-word address space (confirmed against
-// actual game dumps: Hayazashi Nidan Morita Shogi's ST011 program uses
-// 16364 of 16384 words). That firmware instead lives in the board's Bus 2
-// SRAM (U511, nominally 4Mbit/512KB per the schematic, but the MCU
-// firmware's own memtest documents real hardware-measured usable capacity
-// as 256KB/0x40000 -- addresses past that read back as noise, not a
-// "4Mbit" chip's honest upper half. This design's actual usage (max
-// ~49KB) is comfortably under either figure, so it doesn't affect
-// correctness here, but comments/docs should cite the real number, not
-// the schematic one) -- a separate physical chip from the PSRAM used for
-// cart ROM/SaveRAM. Some OTHER cores (sd2snes_gsu, sd2snes_sa1) actively
-// drive this same bus for their own working RAM, so "unused" isn't a
-// board-wide property -- but it IS unused within sd2snes_dsp specifically
-// (confirmed: undriven in this project's main.v before this work), and
-// only one core bitstream is ever configured on the FPGA at a time, so a
-// DSP-family cart never has the GSU/SA-1 bitstream loaded regardless of
-// what those cores do with this bus. No conflict for this design.
+// The ST011 program is 16384 24-bit words, too large for on-chip memory. It
+// lives in the board's Bus 2 SRAM (8-bit, 45 ns; 256 KB usable, ~49 KB used),
+// which no other part of this core drives. Each word is stored as 3 bytes at
+// byte address word*3, in the order the MCU sends them (PGM_DI); the
+// byte-order correction to the true instruction is applied on read.
 //
-// Each 24-bit instruction word is stored as 3 consecutive bytes, low byte
-// first (matching the firmware dump format used by ares: byte0 =
-// bits[7:0], byte1 = bits[15:8], byte2 = bits[23:16]), at byte address
-// word_addr*3.
+// Structure, in the order a fetch is served:
+//   1. loop buffer   8 recent words in flip-flops, zero latency
+//   2. cache         4096-entry direct-mapped block RAM, prewarmed with
+//                    words 0..4095 after the firmware download
+//   3. SRAM          ~31 cycles per word (miss_latency_tb)
 //
-// `enable` (=ext_pgm_en) gates the READ (fetch) side only -- when 0
-// (DSP1-4), `pc_stale` never fires, so this module never fetches and
-// `ready` reflects the last completed operation, harmless since the
-// opcode_w mux in upd77c25.v only selects this path when enable=1.
+// No dependency on the core's RST: the MCU downloads the firmware (PGM_WR,
+// $E9) while the DSP is held in reset, so this module must accept writes
+// then. Power-up state comes from initial values applied at configuration.
 //
-// IMPORTANT: this module deliberately has NO dependency on upd77c25's
-// core RST, unlike every other part of that module. Confirmed by tracing
-// the real MCU firmware (mcu_cmd.v's dspx_reset_out defaults to 1'b1 at
-// FPGA-configuration time, so RST=~dspx_reset is asserted from the moment
-// the fpga_dsp bitstream loads; deassert_reset() -- the only place that
-// clears it -- runs at the very end of load_rom(), well after
-// load_dspx()'s firmware download completes) that firmware download
-// happens *specifically* while the CPU core is held in reset -- that's
-// the documented, intentional design pattern this whole family of cores
-// uses (see the NES/Atari "chipfeat must be written before the core
-// leaves reset" invariant in memory.c). An earlier version of this module
-// gated its write-capture logic behind `if(!RST)`, which meant it faithfully
-// obeyed that reset signal by ignoring every single PGM_WR pulse for the
-// entire download -- firmware never reached the SRAM at all. The on-chip
-// pgmrom never had this problem since its underlying RAM primitive has no
-// reset input to begin with; this module needs the same property.
-// Power-up defaults come from the initial values below (Verilog `= value`
-// declarations), which SRAM-based FPGA configuration applies as part of
-// loading the bitstream -- equivalent to a reset for this module's actual
-// purposes, since a fresh load_reconfigure_fpga() call (which always runs
-// first in load_rom(), switching from whatever core -- typically the
-// menu's own fpga_base -- was previously active) precedes every firmware
-// download in the normal flow.
-//
-// Firmware download reuses the *same* PGM_WR/PGM_DI/PGM_WR_ADDR signals
-// that already feed the on-chip pgmrom for DSP1-4 (driven by mcu_cmd.v's
-// existing $e9 SPI-download command) -- no MCU-firmware changes needed,
-// only where the FPGA routes those bytes on arrival.
-//
-// RAM_OE/RAM_WE are ACTIVE-LOW (confirmed from the MCU firmware's own
-// fault-classification code, which refers to them as "CE#/OE#/WE#" --
-// standard notation for active-low control signals on an async SRAM part;
-// there's no separate CE pin exposed to the FPGA at all, so it's presumably
-// tied active on the board since this bus has only one chip on it).
-// Asserted = 0, idle/inactive = 1.
-//
-// Each byte access spends one cycle with the address presented and both
-// control lines still deasserted (basic address-setup margin before OE/WE
-// assert -- real async SRAM parts generally want this) before actually
-// asserting OE or WE for HOLD_CYCLES.
-//
-// NOTE: HOLD_CYCLES below is a conservative default sized to safely exceed
-// the SRAM's 45ns access/write time across a wide range of plausible
-// system-clock frequencies. It hasn't been tuned against this design's
-// actual system clock, and should be verified (and can likely be reduced)
-// once that's confirmed.
+// RAM_OE/RAM_WE are active low. Each byte access presents the address for
+// one cycle with both deasserted before asserting OE or WE.
 
 module upd77c25_extpgm (
   input CLK,
@@ -107,14 +49,8 @@ module upd77c25_extpgm (
   input [13:0] PGM_WR_ADDR,
   output wr_busy,
 
-  // Readback verification sweep. The MCU's $E9 download path can only
-  // prove what it SENT; this reads every word back OUT of the SRAM and
-  // checksums it, proving what actually landed in the chip. Triggered by
-  // SPI command $E5, result read via $F5.
-  // PSRAM fetch path (PGM_IN_PSRAM=1). Reads the DSP program from the
-  // main PSRAM instead of the Bus 2 SRAM: 16-bit wide so a 24-bit word
-  // takes 2 accesses instead of 3, and it is the bus that already
-  // carries game ROM reliably at full SNES speed.
+  // Readback checksum sweep ($E5 start, $F5 result).
+  // PSRAM fetch path (PGM_IN_PSRAM=1, unused and incomplete).
   output reg psram_rrq = 1'b0,
   output reg [23:0] psram_addr = 24'd0,
   input [15:0] psram_din,
@@ -124,21 +60,15 @@ module upd77c25_extpgm (
   output reg vsum_busy = 1'b0,
   output reg [31:0] vsum = 32'd0,
 
-  // physical SRAM bus (board's Bus 2 SRAM: nominally 4Mbit/512KB, really
-  // 256KB usable -- see comment above; 8-bit, 45ns)
+  // physical SRAM bus (Bus 2 SRAM, 8-bit, 45ns)
   output reg [18:0] RAM_ADDR,
   inout [7:0] RAM_DATA,
   output reg RAM_OE = 1'b1, // active-low: 1 = deasserted/idle
   output reg RAM_WE = 1'b1
 );
 
-  // SRAM needs 45ns settling (4.3 cycles at this design's confirmed
-  // 96MHz). The 2-cycle synchronizer latency (ram_data_s1/s2 below)
-  // comes out of this budget, so HOLD=8 leaves 6 cycles = 62.5ns of real
-  // settling -- still ~1.4x the spec, while saving 6 cycles per word on
-  // every cache miss versus the previous value of 10. Speed matters here
-  // for the reason described at CACHE_BITS below: uncached fetches are
-  // the throughput bottleneck, not a rare path.
+  // SRAM needs 45ns (4.3 cycles at 96MHz). The 2-cycle synchronizer comes out
+  // of this budget, so HOLD=8 leaves 62.5ns of settling, ~1.4x the spec.
   localparam HOLD_CYCLES = 8;
 
   localparam S_IDLE       = 5'd0,
@@ -148,116 +78,35 @@ module upd77c25_extpgm (
              S_RD_ADDR0   = 5'd10, S_RD_HOLD0 = 5'd11,
              S_RD_ADDR1   = 5'd12, S_RD_HOLD1 = 5'd13,
              S_RD_ADDR2   = 5'd14, S_RD_HOLD2 = 5'd15;
-             // S_CACHE_CHECK (was 5'd16) is gone: the cache lookup is
-             // now continuous and needs no state of its own.
 
   localparam POST_CYCLES = 2; // address/data hold margin after WE deasserts
 
   reg [4:0] state = S_IDLE;
-  reg [6:0] hold_cnt; // widened from [3:0] so HOLD_CYCLES can exceed 15
-                       // (needed for the long-settle diagnostic build)
+  reg [6:0] hold_cnt;
   reg [1:0] post_cnt;
 
-  // Small on-chip cache for recently-fetched program words. Direct-mapped,
-  // 512 entries; each entry stores the 24-bit word plus a 5-bit tag and a
-  // valid bit, packed into single arrays so Quartus can infer block RAM
-  // (~15Kbit total, roughly two M9K blocks -- cheap against this design's
-  // ~48% free memory headroom).
-  //
-  // Intended to absorb hot loops (tight wait-loops, small inner
-  // computation loops) without touching the external SRAM bus at all --
-  // the one part of this design that can't be fully verified through
-  // simulation, since an idealized behavioral SRAM model can't capture
-  // real board-level timing/electrical behavior the way physical hardware
-  // would exercise it. A cache hit means zero external bus activity for
-  // that fetch; a miss falls through to the existing, already-verified
-  // external fetch path unchanged.
-  //
-  // The valid bit is packed as the MSB of the tag word rather than living
-  // in its own 1-bit-wide array: a separate narrow array (especially with
-  // an `initial` loop clearing it) tends to be implemented as discrete
-  // logic registers instead of block RAM, which would cost ~512 registers
-  // and add routing pressure this design doesn't need -- particularly
-  // given it has already hit one timing-closure failure.
-  //
-  // Power-up state comes from the array's initial value, applied by FPGA
-  // configuration (same mechanism the rest of this module relies on --
-  // see the header comment about deliberately having no RST dependency).
-  // Set to 0 to bypass the cache entirely (diagnostic builds): every
-  // fetch then goes straight to the external SRAM sequence, exactly as
-  // it did before the cache existed. Kept as a parameter so a
-  // cache-disabled build differs from the real one by a single line,
-  // with no risk of hand-editing introducing unrelated changes.
+  // On-chip cache of program words, direct-mapped on pc[CACHE_BITS-1:0], with
+  // the remaining pc bits as tag. A hit costs no SRAM access. Set CACHE_ENABLE
+  // to 0 to send every fetch to the SRAM (diagnostic builds only).
   parameter CACHE_ENABLE = 1;
 
-  // 4096 entries, covering 25% of ST011's 16,364-word program.
-  //
-  // Sized this way because the cache turns out to be architecturally
-  // necessary, not an optimization. The external SRAM is 8-bit at 45ns,
-  // so a 24-bit instruction needs three sequential byte reads: ~135ns
-  // minimum, against ~122ns per instruction on the real 8.192MHz chip.
-  // Uncached execution therefore CANNOT reach real-chip speed no matter
-  // how the read sequence is tuned, and these games are real-time
-  // coprocessors whose host expects results within a hardware-derived
-  // window.
-  //
-  // That explains the observed behaviour precisely: ST010's 533 words
-  // fit the cache entirely, so it runs several times faster than real
-  // silicon and works; with the cache off it runs ~3x SLOWER than real
-  // and glitches. The SRAM path itself is fine -- every cached word came
-  // through it correctly exactly once, which is why one pass works and
-  // sustained uncached execution does not.
-  //
-  // 8192 entries was tried first and did NOT fit: Quartus reported the
-  // design needing more than the device's 56 M9K blocks, with total
-  // memory at 93%. A 24-bit-wide memory packs poorly into M9K blocks
-  // (which favour widths like 8/9, 16/18, 32/36), so block count runs
-  // out before bit count does. 4096 entries needs ~13 blocks instead of
-  // ~23, putting total memory near 73% with real margin.
-  // Read-verify: read every word from the external SRAM twice and only
-  // commit when two consecutive reads agree, retrying on disagreement.
-  //
-  // DEFAULT IS NOW 0. It was written to test the hypothesis that the
-  // external SRAM read path had a low but nonzero error rate. That
-  // hypothesis is dead: the readback sweep matched across all 16,384
-  // words through this same path, the sticky-DR and fault-injection
-  // experiments found nothing, and the actual fault turned out to be
-  // throughput, not data integrity.
-  //
-  // Leaving it on was expensive. Measured with miss_latency_tb.v at
-  // 96MHz:
-  //
-  //     READ_VERIFY=1   630.7 ns per miss  (60.5 cycles)
-  //     READ_VERIFY=0   323.1 ns per miss  (31.0 cycles)
-  //
-  // ST011's host protocol gives the DSP 372 ns per byte, so a single
-  // verified miss cost 1.7 entire byte slots -- and every instruction
-  // costs one the first time it executes. Turning it off is what took
-  // the fix from "runs much longer, still dies" to stable.
-  //
-  // Set to 1 to restore double-read behaviour if an SRAM integrity
-  // question ever comes back; the retry/MAX_RETRY machinery below is
-  // unchanged and simply goes unused at 0.
+  // Throughput requires the cache: three sequential 45ns SRAM reads per word
+  // cannot keep up with ST011's DMA transfers (see upd77c25.v THROUGHPUT).
+  // Read-verify: read each missed word twice, commit on agreement. Keep 0.
+  // The SRAM path has been verified (16,384-word readback sweep), and at 1 a
+  // miss costs 60.5 cycles instead of 31 -- more than one DMA byte slot.
   parameter READ_VERIFY = 0;
 
   // ---- LOOP BUFFER ------------------------------------------------------
   //
-  // A small fully-associative buffer of recently-fetched words, in
-  // flip-flops. Checked in parallel with the cache and hit with ZERO
-  // latency, so a hit costs no stall cycles.
+  // Fully-associative buffer of recently fetched words, in flip-flops, checked
+  // in parallel with the cache and hit with zero latency. It serves loops whose
+  // words are not in the cache: high-address code (above 4095, or aliasing
+  // onto pinned slots) runs at full speed after its first iteration. Inserts
+  // only happen on demand fetches, so a resident loop stays resident.
   //
-  // Why this instead of a bigger cache: the direct-mapped cache is prewarmed
-  // over words 0..(2^CACHE_BITS-1) only, and anything above that both misses
-  // and evicts a prewarmed entry through index aliasing. Growing it does not
-  // fit -- 8192 entries needs 12 RAMB16 on mk2 against the 6 in use. But the
-  // requirement is not "hold the program", it is "hold the transfer loop
-  // during a transfer": of the 382 real-time windows in the reference trace,
-  // 380 execute exactly FOUR consecutive words. Eight entries is twice that,
-  // and costs no block RAM at all.
-  //
-  // Sized 8 rather than 16 deliberately -- this is a combinational compare
-  // feeding `ready`, and mk2 only just closed timing. Raise it if the fitter
-  // has room; 0 removes the feature.
+  // Sized 8: it is a combinational compare feeding `ready`, and the ST011
+  // transfer loops are 4 words. 0 removes it.
   parameter LOOPBUF_ENTRIES = 8;
   localparam LB_IDX = (LOOPBUF_ENTRIES <= 2) ? 1 : (LOOPBUF_ENTRIES <= 4) ? 2
                     : (LOOPBUF_ENTRIES <= 8) ? 3 : 4;
@@ -284,11 +133,8 @@ module upd77c25_extpgm (
   generate
     for(lbg = 0; lbg < LOOPBUF_ENTRIES; lbg = lbg + 1) begin : LB
       assign lb_match[lbg] = lb_val[lbg] && (lb_tag[14*lbg +: 14] == pc);
-      // one-hot OR chain rather than a priority mux: duplicate entries for
-      // the same pc hold identical data, so OR-ing is safe.
-      // Priority, not plain OR: take the LOWEST matching entry. If two
-      // entries ever held the same pc with different data, OR-ing them
-      // returns garbage rather than either value.
+      // Priority: take the LOWEST matching entry, so duplicate entries can never
+      // OR together into garbage.
       assign lb_first[lbg] = lb_match[lbg] & ~|(lb_match & ((1<<lbg)-1));
       assign lb_chain[lbg+1] = lb_chain[lbg]
                              | (lb_first[lbg] ? lb_data[24*lbg +: 24] : 24'd0);
@@ -314,15 +160,9 @@ module upd77c25_extpgm (
   generate
     for(lbg = 0; lbg < LOOPBUF_ENTRIES; lbg = lbg + 1) begin : LBW
       always @(posedge CLK) begin
-        // PGM_WR invalidates, and so does the cycle after it: lb_insert
-        // registers its write, so an insert issued just before a firmware
-        // write would otherwise land one cycle LATER and re-insert the
-        // stale pre-write word. extpgm_tb catches exactly this.
-        // Invalidate for the WHOLE write sequence, not just the PGM_WR
-        // pulse. The SRAM write takes many cycles; a fetch already in
-        // flight completes with PRE-write data and lb_insert lands after
-        // it, re-inserting a stale word. The same hazard is why
-        // pc_last_done is reset and the cache entry invalidated here.
+        // Invalidate on PGM_WR, the cycle after it, and for the whole SRAM write
+        // sequence: a fetch in flight or a registered lb_insert would otherwise land
+        // afterwards with the pre-write word. extpgm_tb covers this.
         if(PGM_WR || pgm_wr_r || wr_busy)   lb_val[lbg] <= 1'b0;
         else if(lb_wr && (lb_wr_idx == lbg)) begin
           lb_tag [14*lbg +: 14] <= lb_wr_addr;
@@ -347,17 +187,9 @@ module upd77c25_extpgm (
     end
   endtask
 
-  /* Fetch program words from the main PSRAM rather than the Bus 2 SRAM.
-     Rationale: PSRAM is 16-bit (2 accesses per 24-bit word vs 3), and it
-     is proven -- it carries the game ROM and is read continuously at full
-     SNES speed. The Bus 2 SRAM is the bus implicated by the observation
-     that running a 16384-word readback sweep introduced fresh glitches
-     in an otherwise-working ST010, which points at sustained traffic on
-     that bus disturbing the board rather than at any per-read fault.
-     Word N occupies bytes N*3 .. N*3+2 at PSRAM byte address
-     PGM_PSRAM_BASE + N*3, matching the layout the MCU writes. */
-  // 0 = use the Bus 2 SRAM path (known good). The PSRAM path is
-  // incomplete and fails its own testbench -- see README_PSRAM_WIP.md.
+  // PSRAM program fetch (PGM_IN_PSRAM=1): word N at PGM_PSRAM_BASE + N*3.
+  // UNUSED AND INCOMPLETE -- fails its own testbench. The Bus 2 SRAM path
+  // (PGM_IN_PSRAM=0) is the verified one.
   parameter PGM_IN_PSRAM = 0;
   parameter [23:0] PGM_PSRAM_BASE = 24'hD00000;
 
@@ -367,13 +199,8 @@ module upd77c25_extpgm (
   reg [15:0] pword0;
   reg [23:0] pbyte_addr;
 
-  // Retry cap. Without one, a high error rate would livelock: two reads
-  // would rarely agree, the fetch would never complete, and the DSP would
-  // stall -- which on hardware looks exactly like a hang, i.e. the very
-  // symptom being investigated. After MAX_RETRY disagreements the last
-  // read is accepted as best effort so forward progress is guaranteed.
-  // Found by fault-injection simulation, which hung at a 1-in-7 error
-  // rate before this was added.
+  // Retry cap for READ_VERIFY: after MAX_RETRY disagreements the last read is
+  // accepted, so a noisy read can never stall the DSP.
   localparam MAX_RETRY = 4;
 
   reg [13:0] vsum_addr = 14'd0;
@@ -384,80 +211,34 @@ module upd77c25_extpgm (
   reg [2:0] retry_cnt = 3'd0;
   reg [15:0] verify_errors = 16'd0; // mismatches seen (diagnostic counter)
 
-  // 8192 entries. Static reachability on the real ST011 firmware shows
-  // 6603 live words (only 12 dispatch commands are ever issued by the
-  // game), so 8192 covers the whole working set with headroom while
-  // 4096 leaves ~2500 words permanently thrashing. Associativity was
-  // measured and does not help -- this is a capacity limit, not a
-  // conflict one.
   localparam CACHE_BITS = 12; // 4096 entries
-  //
-  // 4096 rather than 8192, to free 12 M9K blocks for the full 16384-word
-  // msu_databuf. The time-critical path survives the halving: the trace's
-  // real-time windows are four CONSECUTIVE words (380 of 382 of them), and
-  // four consecutive addresses can never conflict in a direct-mapped cache.
-  // The transfer loops live at words 197-200 and 243-246, both inside the
-  // prewarmed 0..4095 range, so they stay resident. What degrades is
-  // command code above word 4095, which is not real-time -- there the host
-  // is waiting on the DSP rather than the reverse.
-  //
-  // An entry is now valid(1) + tag(2) + data(24) = 27 bits. Packed as
-  // 18 + 9, both native M9K widths:
-  //     cache_data_lo  4096 x 18  {tag[1:0], data[15:0]}   8 blocks
-  //     cache_data_hi  4096 x  9  {valid,    data[23:16]}  4 blocks
-  // The valid bit moved from lo to hi so the 18-bit half is exactly full;
-  // invalidation and the power-on sweep therefore clear HI, not LO.
+  // 4096 entries (the largest that fits mk2) and identical on mk2 and mk3.
+  // Every word in the ST011 real-time transfer windows is below 256, inside
+  // the prewarmed range. Entry = valid(1) + tag(2) + data(24), packed as
+  // 18 + 9 bits, both native block RAM widths:
+  //     cache_data_lo  4096 x 18  {tag[1:0], data[15:0]}
+  //     cache_data_hi  4096 x  9  {valid,    data[23:16]}
+  // Invalidation and the power-on sweep clear HI.
   localparam CACHE_TAG_BITS = 14 - CACHE_BITS; // 2 bits at 4096 entries
                                                 // (index+tag must cover
                                                 // pc's full 14 bits)
-  // Split into 16-bit and 8-bit arrays rather than one 24-bit array.
-  // M9K blocks are optimised for 8/9, 16/18 and 32/36-bit widths; a
-  // 24-bit array wastes part of every block, which is why an earlier
-  // 8192-entry attempt exhausted the device's 56 blocks at only 93% of
-  // total memory BITS. Two native-width arrays pack cleanly.
-  /* 18 bits wide: {valid, tag, data[15:0]}. M9K natively supports an
-     18-bit width (16 + 2 spare bits), so this costs exactly the same 16
-     blocks as a 16-bit array while carrying the tag and valid bit for
-     free -- removing the separate tag array entirely and the 8 blocks it
-     needed. */
   reg [CACHE_TAG_BITS+15:0] cache_data_lo [0:(1<<CACHE_BITS)-1];
   reg [8:0]  cache_data_hi [0:(1<<CACHE_BITS)-1];
   // [CACHE_TAG_BITS] = valid, [CACHE_TAG_BITS-1:0] = tag
 
-  // Cache invalidation sweep state.
-  //
-  // Clears one entry per clock after configuration rather than using an
-  // `initial` loop: Quartus refuses to unroll loops beyond 5000
-  // iterations, so an initial-block clear fails synthesis outright at
-  // 8192 entries ("loop must terminate within 5000 iterations"). Icarus
-  // has no such limit, which is why simulation passed while synthesis
-  // did not. A sweep is also the conventional way to initialize inferred
-  // block RAM, since block RAM has no reset input.
-  //
-  // The sweep runs inside the main always block below, not its own:
-  // cache_data_lo must have exactly one driver, and the fetch/write paths
-  // already write it.
-  //
-  // It completes in 4096 cycles (~43us at 96MHz) -- vastly shorter than
-  // the firmware download that follows, so it always finishes long
-  // before the first fetch. cache_ready gates hits until then, so a
-  // fetch during the sweep simply misses and goes to the external SRAM,
-  // which is always correct.
+  // Cache invalidation sweep: clears one entry per clock after configuration
+  // (Quartus will not unroll a 4096-iteration initial loop, and block RAM has
+  // no reset). Lives in the main always block so each array keeps one write
+  // port. Takes ~43us, long before the first fetch; cache_ready gates hits
+  // until it completes.
   reg [CACHE_BITS-1:0] init_addr = {CACHE_BITS{1'b0}};
   reg cache_ready = 1'b0;
 
   // registered cache-read outputs, matching block RAM's synchronous-read
   // behavior (address presented one cycle, data available the next)
-  /* Single write port for cache_data_lo.
-     Block RAM can only be inferred when an array has ONE write address
-     expression. cache_data_lo was previously written from three
-     different addresses (init sweep, write-invalidate, fill), so Quartus
-     built all 8192x18 bits from registers -- 147456 of the 151217
-     registers in the failing fit. cache_data_hi inferred correctly only
-     because every one of its writes happened to use pc_r.
-     All writes now funnel through these, with a single array assignment
-     at the end of the always block. Blocking assignments, so the value
-     set earlier in the same evaluation is the one that gets written. */
+  // Single write port per cache array (lo_* / hi_*), applied at the end of
+  // the always block: block RAM is only inferred when an array has one
+  // write address expression. Blocking assignments, last one wins.
   reg        hi_we;
   reg [CACHE_BITS-1:0] hi_addr;
   reg [8:0]  hi_data;
@@ -467,24 +248,10 @@ module upd77c25_extpgm (
 
   // ---- CACHE LOOKUP TIMING ------------------------------------------
   //
-  // The lookup is issued unconditionally, every cycle, from cache_raddr.
-  // It used to be issued only once the fetch FSM reached S_IDLE and
-  // noticed pc had changed, which cost THREE cycles on every cache HIT
-  // (S_IDLE notices, S_CACHE_CHECK compares, ready asserts). Against a
-  // seven-state core that was a third of the entire instruction time,
-  // and it was paid on hits -- the common case -- not just on misses.
-  //
-  // ST011 has no slack for that. Its host protocol is DMA-paced with no
-  // handshake: the reference trace shows a host access to DR every 8 DSP
-  // instructions, never fewer, while the DSP's transfer loop is 4
-  // instructions long. Miss that budget and DR is overwritten before the
-  // DSP consumes it, the loop counter never reaches zero, and the DSP
-  // parks in its JRQM wait forever. See upd77c25.v's throughput note.
-  //
-  // cache_raddr follows pc_early during the core's STATE_STORE and pc
-  // otherwise, so the tag comparison for the NEXT instruction has
-  // already been registered before the core asks for it, and `ready` is
-  // combinationally true on the first cycle of STATE_NEXT.
+  // The lookup is issued every cycle from cache_raddr, which follows pc_early
+  // during the core's STATE_STORE and pc otherwise. The result for the NEXT
+  // instruction is registered before the core asks for it, so `ready` is true
+  // on the first cycle of STATE_NEXT and a hit costs no stall cycles.
   wire [13:0] cache_raddr = pc_early_valid ? pc_early : pc;
 
   reg [CACHE_TAG_BITS+15:0] cache_rdata_lo;
@@ -517,15 +284,14 @@ module upd77c25_extpgm (
   reg [13:0] pc_r;          // pc the in-flight (or most recent) read is for
 
   // ---- CACHE PINNING ----------------------------------------------------
-  // Words above 2^CACHE_BITS-1 alias into the direct-mapped cache. When such
-  // a word lands on a slot holding real-time transfer code, the next DMA
-  // transfer takes an external fetch on its first pass and overruns DR
-  // (replay_timed_tb: ST011 words 12485..12490 evict slots 197..202, then
-  // the following inbound transfer drops a byte -> the capture freeze).
-  // Every word executed inside a DMA-paced window in the MesenCE trace is
-  // below 256, so high words may not overwrite slots 0..PIN_WORDS-1. They
-  // still land in the loop buffer. Prewarm and PGM_WR invalidation are not
-  // affected (prewarm only fills low words).
+  // High words (pc >= 2^CACHE_BITS) may not overwrite cache slots
+  // 0..PIN_WORDS-1. Those slots hold every word ST011 executes inside a DMA
+  // transfer (0-2, 31, 197-200, 243-247). Without this, a routine at words
+  // 12485-12490 evicts slots 197-202 by aliasing; the next inbound transfer
+  // misses on its first pass, the DMA overwrites an unread byte and the DSP
+  // waits forever -- the "freeze on capturing a piece". Found with
+  // sim/replay_timed_tb.v. Pinned high words still use the loop buffer.
+  // Prewarm (low words only) and PGM_WR invalidation are unaffected.
   parameter PIN_WORDS = 256;
   wire fill_pinned = (pc_r[13:CACHE_BITS] != 0) && (pc_r[CACHE_BITS-1:0] < PIN_WORDS);
   reg [13:0] pc_last_done = 14'h3fff; // "never fetched" sentinel;
@@ -535,36 +301,12 @@ module upd77c25_extpgm (
 
   // ---- ONE-SHOT CACHE PREWARM ----------------------------------------
   //
-  // Even with a one-cycle hit, the FIRST execution of any instruction
-  // still costs a full external fetch: 3 bytes x (HOLD_CYCLES+1) plus
-  // overhead, about 30 cycles, roughly one entire host DMA byte slot.
-  //
-  // That alone is enough to break ST011. Its inbound transfer loop
-  // (words 197-200 in the reference trace) is entered with 199 and 200
-  // uncached; the two cold fetches push the DSP's consumption of the
-  // second byte past the arrival of the third, one byte is lost, the
-  // loop counter never reaches zero, and the DSP hangs. This is why
-  // growing the cache from 512 to 8192 entries changed nothing: the
-  // cache is cold on the first transfer at any size, and the first
-  // transfer is where it dies.
-  //
-  // So: once the firmware download has gone quiet, walk words
-  // 0..(2^CACHE_BITS - 1) through the ordinary read path and fill every
-  // entry, before the core is allowed to fetch anything. `ready` is held
-  // low throughout, so the core simply stalls. Cost is ~2.6ms at 96MHz,
-  // spent while the DSP is doing nothing but spinning in its
-  // command-wait loop, long before the game first invokes it.
-  //
-  // Note this covers words 0..8191 only -- with a direct-mapped
-  // 2^CACHE_BITS-entry cache the upper half of a 16384-word program
-  // aliases onto the same entries, so anything the firmware executes
-  // above word 8191 will still take a cold miss. ST011's measured live
-  // set is 6603 words; if any meaningful part of it turns out to live
-  // above 8191, this needs revisiting (associativity, or the PSRAM
-  // fetch path).
-  //
-  // Set PREWARM_ENABLE to 0 to remove it entirely -- one line, so a
-  // build without it differs by nothing else.
+  // The first execution of any word costs a full external fetch (~31 cycles,
+  // about one DMA byte slot), so a cold transfer loop drops a byte. Once the
+  // firmware download has gone quiet, words 0..(2^CACHE_BITS-1) are walked
+  // through the normal read path to fill the cache before the core may fetch.
+  // `ready` is held low meanwhile (~2.6ms, before the game first uses the DSP).
+  // PREWARM_ENABLE=0 removes it.
   parameter PREWARM_ENABLE = 1;
   localparam [15:0] PREWARM_WR_IDLE = 16'hffff; // ~0.68ms of no PGM_WR
 
@@ -586,27 +328,9 @@ module upd77c25_extpgm (
   reg [7:0] ram_data_out;
   reg ram_data_drive = 1'b0;
 
-  // Two-stage synchronizer for the incoming SRAM data.
-  //
-  // RAM_DATA is genuinely asynchronous with respect to CLK: it's driven
-  // by an external SRAM whose output timing has no relationship to this
-  // FPGA's clock. Sampling it directly into a register (as the read
-  // states did previously) is a metastability hazard -- when the data
-  // transition lands too close to the sampling edge, the captured bit
-  // can settle to either value, or briefly to neither.
-  //
-  // This is invisible in simulation: a behavioral SRAM model responds
-  // perfectly synchronously, so every sample is clean by construction.
-  // It is also completely unaffected by increasing HOLD_CYCLES, because
-  // setup/access time was never the problem -- which is why the earlier
-  // doubled-hold-time diagnostic changed nothing and (wrongly) seemed to
-  // rule timing out entirely.
-  //
-  // The cache experiment is what exposed this: with the cache enabled,
-  // ST010 stopped glitching because most of its 533-word program stopped
-  // touching this path at all; with the cache disabled, the glitches
-  // came straight back. ST011's 16,364-word program constantly evicts a
-  // 512-entry cache, so it stays on this path and fails regardless.
+  // Two-stage synchronizer: RAM_DATA is driven by an external asynchronous
+  // SRAM, so sampling it directly would be a metastability hazard (invisible
+  // in simulation).
   reg [7:0] ram_data_s1;
   reg [7:0] ram_data_s2;
   always @(posedge CLK) begin
@@ -617,22 +341,10 @@ module upd77c25_extpgm (
   assign RAM_DATA = ram_data_drive ? ram_data_out : 8'bz;
   assign wr_busy = wr_pending | (state >= S_WR_ADDR0 && state <= S_WR_POST2);
 
-  // Combinational, not registered: this is the fix for a real race found
-  // on real hardware. When cpu_wait=0 (the ST011 case -- see
-  // smc.c's fpga_dspfeat=0 for has_st0010), the CPU's STATE_NEXT check of
-  // this signal can happen on the exact same clock edge pc just changed.
-  // A registered "ready" that only updates in reaction to pc changing
-  // (one clock edge behind the change itself) would still show the OLD
-  // fetch's "ready=1" on that first edge, letting the CPU read `dout`
-  // before the real fetch for the new pc had even started -- which reads
-  // as "only the first instruction ever fetches correctly" once every
-  // instruction after that races ahead on stale data. Defining `ready`
-  // this way instead means it reflects the true current state with zero
-  // lag: false the instant pc no longer matches what dout holds, true the
-  // instant pc_last_done catches back up.
-  // A hit that has already been registered by the continuous lookup is
-  // servable in the same cycle -- pc_last_done catches up one cycle
-  // later, purely so the value stays held if pc stops changing.
+  // Combinational, so `ready` drops the same cycle pc changes (cpu_wait=0 in
+  // ST011). A registered ready would briefly show the previous fetch's result
+  // for the new pc. A hit already registered by the lookup, or a loop-buffer
+  // hit, is served in the same cycle.
   assign ready = ~enable
                | (((pc_last_done == pc) | cache_hit_now | lb_hit)
                   & ~wr_busy & ~prewarm_active);
@@ -648,13 +360,8 @@ module upd77c25_extpgm (
   wire pc_stale = enable && (pc_last_done != pc);
 
   // word address -> byte address (x3), via shift+add rather than a
-  // multiplier
-  // pc_r * 3, REGISTERED. Computing it combinationally put a 17-bit carry
-  // chain (multiply, then the +1/+2 for the second and third bytes) between
-  // pc_r and RAM_ADDR in a single cycle -- the worst remaining CLK21 path on
-  // the mk2 XC3S400 at -0.287 ns. pc_r is loaded one cycle before RAM_ADDR is
-  // driven, so registering the multiply alongside every pc_r load costs
-  // nothing and removes the multiply from the tail.
+  // pc_r * 3 (word -> byte address), registered alongside every pc_r load to
+  // keep the carry chain off the pc_r -> RAM_ADDR path (mk2 timing).
   reg  [16:0] pc_r_byte0_r = 17'd0;
   wire [16:0] pc_r_byte0      = pc_r_byte0_r;
   wire [16:0] wr_addr_r_byte0 = {wr_addr_r, 1'b0} + wr_addr_r;
@@ -689,9 +396,8 @@ module upd77c25_extpgm (
         wr_pending_addr <= PGM_WR_ADDR;
         wr_pending_data <= PGM_DI;
       end
-      // Cache invalidation sweep -- must run on this path too. It
-      // previously lived only in the SRAM branch, so selecting PSRAM
-      // left cache_ready deasserted forever and the fetch FSM gated off.
+      // Cache invalidation sweep must run on this path too, or cache_ready
+      // never asserts.
       if(!cache_ready) begin
         hi_we = 1'b1; hi_addr = init_addr; hi_data = 9'd0;
         if(init_addr == {CACHE_BITS{1'b1}}) cache_ready <= 1'b1;
@@ -743,13 +449,7 @@ module upd77c25_extpgm (
 
     end else begin
     // ---- Bus 2 SRAM fetch path (PGM_IN_PSRAM=0) ----
-    // lb_wr is a one-shot: lb_insert raises it, the generate block below
-    // consumes it next cycle. It MUST be cleared unconditionally every
-    // cycle. It was previously defaulted next to psram_rrq, which sits
-    // inside the PGM_IN_PSRAM branch and therefore never runs here -- so
-    // lb_wr latched high for the whole firmware-write sequence and the
-    // stale pre-write word was re-inserted the moment wr_busy dropped.
-    // That is the extpgm_tb write-hazard failure.
+    // lb_wr is a one-shot and must be cleared every cycle on this path.
     lb_wr <= 1'b0;
 
 
@@ -861,12 +561,8 @@ module upd77c25_extpgm (
             // against post-write data.
             state <= S_IDLE;
           end else if(CACHE_ENABLE != 0 && !cache_q_current) begin
-            // The continuous lookup has not caught up with this pc yet
-            // (it changed on this very edge, and pc_early_valid was not
-            // driven -- e.g. a savestate restore, or a build with the
-            // lookahead tied off). Wait one cycle rather than treating
-            // an unrelated tag as a miss and burning 30 cycles on the
-            // SRAM for a word that is very likely cached.
+            // The lookup has not caught up with this pc yet (pc_early not driven).
+            // Wait one cycle rather than treat an unrelated tag as a miss.
             state <= S_IDLE;
           end else if(CACHE_ENABLE != 0 && cache_hit_now) begin
             // Fast path: no external SRAM access at all. `ready` and
@@ -886,8 +582,7 @@ module upd77c25_extpgm (
             lb_insert(pc, cache_rdata);
             state <= S_IDLE;
           end else begin
-            // Miss (or cache disabled): the existing, unmodified
-            // external fetch sequence, exactly as before.
+            // Miss: external SRAM fetch.
             pc_r <= pc;
             pc_r_byte0_r <= {pc, 1'b0} + pc;
             state <= S_RD_ADDR0;
@@ -959,18 +654,10 @@ module upd77c25_extpgm (
       S_WR_POST2: begin
         if(post_cnt == 0) begin
           ram_data_drive <= 1'b0;
-          // A write just landed -- invalidate any cached fetch result.
-          // Defense in depth: in the traced normal flow, no fetch can
-          // happen at all until the CPU core leaves reset, well after
-          // download completes, so this shouldn't ever have stale data to
-          // invalidate in practice -- but it costs nothing to keep, and
-          // protects against any load path that doesn't match the one
-          // traced (a mid-session reload without a full FPGA
-          // reconfiguration, for instance).
+          // A write landed: invalidate the last fetch result. (The DSP is held in
+          // reset during download, so this is a safeguard.)
           pc_last_done <= 14'h3fff;
-          // Also invalidate the small on-chip cache's corresponding slot
-          // (unconditional, no tag check needed: if this slot wasn't
-          // caching this exact address, invalidating it is harmless).
+          // and the cache slot (no tag check needed).
           hi_we = 1'b1; hi_addr = wr_addr_r[CACHE_BITS-1:0]; hi_data = 9'd0;
           state <= S_IDLE;
         end else post_cnt <= post_cnt - 1;
@@ -978,26 +665,9 @@ module upd77c25_extpgm (
 
       // ---- read the three bytes of one word ----
       //
-      // OE is asserted ONCE at the start and held LOW across all three
-      // bytes, rather than pulsed separately for each. The previous
-      // version deasserted OE between every byte, which meant:
-      //   - the bus went high-impedance (floating) three times per word,
-      //     and the synchronizer sampled that floating bus into its
-      //     pipeline during each gap
-      //   - every byte had to re-satisfy the SRAM's full access time
-      //     (tAA) from scratch after OE re-asserted
-      // Holding OE low across the word removes both. Only the address
-      // changes between bytes, so each subsequent byte needs the SRAM's
-      // address-access time with the output already enabled and driving
-      // -- no float, no output-enable turn-on delay, no chance to sample
-      // an undriven bus.
-      //
-      // This matters more than it looks: the read path was the one part
-      // of the design that real hardware exercised differently from
-      // simulation. A behavioural SRAM model drives a defined value the
-      // instant OE asserts and never floats meaningfully, so the
-      // pulse-per-byte scheme looked perfectly clean in every simulation
-      // while being fragile on the actual board.
+      // OE is asserted once and held low across all three bytes: only the address
+      // changes, so the bus never floats between bytes and each byte needs only
+      // address-access time.
       S_RD_ADDR0: begin
         RAM_ADDR <= {2'b0, pc_r_byte0};
         RAM_OE <= 1'b0; // assert once, stays low for the whole word
@@ -1034,20 +704,11 @@ module upd77c25_extpgm (
         RAM_OE <= 1'b0;
         if(hold_cnt == 0) begin
           RAM_OE <= 1'b1; // release only now, after the whole word
-          // Byte-order correction: PGM_DI as received is byte-reversed
-          // relative to the true instruction (ares dumps little-endian,
-          // this loader assembles big-endian). Verified numerically
-          // against the real firmware: 0/20 words matched without this
-          // correction, 20/20 with it. See also upd77c25.v's
-          // dat_doutb_fixed for the identical fix on the data-ROM path.
+          // Byte-order correction: PGM_DI is byte-reversed relative to the true
+          // instruction. See also upd77c25.v dat_doutb_fixed.
           if(prewarm_active) begin
-            // Prewarm word complete: fill the entry and step on.
-            // Deliberately bypasses dout_r/pc_last_done -- the core is
-            // stalled (ready is gated by prewarm_active) and must not
-            // observe any of this as a fetch result. Single read, no
-            // READ_VERIFY second pass: this runs 8192 times and a wrong
-            // word here is self-correcting, since a cache miss on it
-            // later just re-reads from the SRAM.
+            // Prewarm word complete: fill the entry and step on. Bypasses
+            // dout_r/pc_last_done (the core is stalled). Single read, no READ_VERIFY.
             lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
             lo_data = {pc_r[13:CACHE_BITS], byte1, ram_data_s2};
             hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
