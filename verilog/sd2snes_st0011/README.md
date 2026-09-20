@@ -28,8 +28,9 @@ is held in reset. Each fetch is served from the fastest source that has it:
 
 ```
 loop buffer   8 recent words, flip-flops, zero latency
-cache         4096 entries, direct-mapped block RAM, prewarmed with words
-              0..4095 after the download; a hit costs no stall cycles
+pinned table  words 0..255, block RAM, prewarmed after the download
+cache         512 entries, direct-mapped block RAM, all other words,
+              filled on demand
 Bus 2 SRAM    ~31 cycles per word (3 bytes, 45 ns part)
 ```
 
@@ -44,20 +45,24 @@ waits forever.
 
 At 96 MHz a cached instruction takes 6 cycles (62.5 ns), about 6 per byte
 slot. An SRAM fetch takes a whole slot, so the transfer code must never
-miss. Four mechanisms ensure that:
+miss. Four mechanisms ensure that (a table or cache hit costs no stall
+cycles):
 
 - **`SKIP_ALU2`, `PC_LOOKAHEAD`** — 6 cycles per instruction; the next PC is
   looked up in the cache one cycle early.
-- **Prewarm** — words 0..4095 are cached before the game first uses the
+- **Pinned table** — every word executed during a DMA transfer is below 256
+  (0–2, 31, 197–200, 243–247). Those words live in their own table, which
+  nothing else can write. With a single shared cache, a routine at words
+  12485–12490 once evicted the inbound loop by aliasing, and the next
+  transfer dropped a byte: this was the "freeze on capturing a piece".
+- **Prewarm** — the pinned table is filled before the game first uses the
   DSP, so the first transfer is not cold.
-- **Cache pinning** (`PIN_WORDS = 256`) — words above 4095 may not overwrite
-  cache slots 0–255. Every word executed during a DMA transfer is in that
-  range (0–2, 31, 197–200, 243–247). Without pinning, a routine at words
-  12485–12490 evicts slots 197–202 by aliasing, the next inbound transfer
-  misses on its first pass and drops a byte: this was the "freeze on
-  capturing a piece".
-- **Loop buffer** — tight loops outside the cache (high addresses, or
-  aliasing onto pinned slots) run at full speed after their first iteration.
+- **Loop buffer** (`LOOPBUF_ENTRIES`, default 0, i.e. off) — an associative
+  buffer of recently fetched words. It was there to protect the transfer
+  loops from eviction, which the pinned table now does: over the full trace,
+  8 entries and 0 give the same 8.0% miss rate. Its compares hang off `pc`
+  and feed both `ready` and the opcode decode, and that path failed
+  TS_CLK21 on mk2 by 2.655 ns, so it is off.
 
 ## Removed relative to `sd2snes_dsp`
 
@@ -81,33 +86,43 @@ ordering ever changes the core stalls at pc=0 instead of executing garbage.
 ## Block RAM (mk2, XC3S400, 16 RAMB16)
 
 ```
-cache_data_lo    4096 x 18    4
-cache_data_hi    4096 x  9    2
+pin_data          256 x 25    1
+cache_data        512 x 30    1
 upd77c25_datram  2048 x 16    2
 upd77c25_datrom  2048 x 16    2
 snescmd_buf      1024 x  8    1
-                             11
+                              7
 ```
 
-The last mk2 build reported 13 of 16 RAMB16 and 80% slice occupancy, with
-TS_CLK21 met. `CACHE_BITS = 13` would need 12 RAMB16 for the cache alone and
-does not fit mk2; it is kept at 12 on mk3 too so both targets behave
-identically.
+The last mk2 build reported 7 RAMB16, 2,903 of 3,584 slices (80%), 4,329
+LUTs (60%) and 2,963 flip-flops (41%).
+
+Before the split cache (4096 × 27 bits, 6 RAMB16) the arrays totalled 11 and
+the build reported 13 of 16 RAMB16 at 80% slice occupancy. Check the map
+report after rebuilding: the two memories must infer as block RAM (they carry
+`ram_style = "block"` for XST), not distributed RAM.
+
+Modelled over the full MesenCE trace, the split cache misses on 8.0% of
+instructions against 10.2% for the old pinned 4096-entry cache. Both targets
+use the same configuration.
 
 ## Configuration
 
 ```
 upd77c25.v         SKIP_ALU2=1  PC_LOOKAHEAD=1  PREWARM_ENABLE=1
-                   LOOPBUF_ENTRIES=8  READ_VERIFY=0
+                   LOOPBUF_ENTRIES=0  READ_VERIFY=0
                    stack 16 entries, regs_sp 4 bits
-upd77c25_extpgm.v  CACHE_BITS=12  PIN_WORDS=256  PGM_IN_PSRAM=0
+upd77c25_extpgm.v  CACHE_BITS=9 (512)  PIN_BITS=8 (256)  PGM_IN_PSRAM=0
 mcu/smc.c          ST0011_WAITSTATES 0
 ```
 
 - `READ_VERIFY=1` doubles the cost of a miss (31 → 60.5 cycles); keep 0.
 - `PGM_IN_PSRAM=1` selects an unfinished PSRAM fetch path that fails its
   own testbench; keep 0.
-- Raise `PIN_WORDS` only if some firmware's real-time code sits above 255.
+- `LOOPBUF_ENTRIES` > 0 re-enables the loop buffer. It buys nothing with the
+  split cache and costs mk2 timing. At 0 the loop-buffer vectors keep one
+  unused bit, because XST rejects a `[-1:0]` declaration.
+- Raise `PIN_BITS` only if some firmware's real-time code sits above 255.
 
 ## Building
 
@@ -146,18 +161,30 @@ needed.
 `tools/iss.c` is an instruction-level uPD96050 model. Against the full
 MesenCE gameplay trace (136.6 M DSP instructions) it matches every register
 and flag with zero mismatches. Both replay harnesses drive the real RTL
-(`upd77c25` + `upd77c25_extpgm`, including download, prewarm, cache, pinning
-and loop buffer) from that trace:
+(`upd77c25` + `upd77c25_extpgm`, including download, prewarm, pinned table,
+cache and loop buffer) from that trace:
 
 - **`sim/replay_tb.v`** — the core pauses between instructions while host
   events are applied. Checks logic only. All 8,084,029 trace records:
   0 divergences.
 - **`sim/replay_timed_tb.v`** — free-running; DMA bytes arrive at the real
   cadence, CPU-paced events wait for the core. Reports any DR overrun
-  immediately. Without cache pinning it fails at record 3,283,498 (the
-  capture freeze); with pinning, records 0–4,100,000 pass. With
-  `HOST_SCALE=0.5` it reports overruns from the first transfer, confirming
-  it detects them.
+  immediately. With an unprotected cache it fails at record 3,283,498 (the
+  capture freeze); with the pinned table it passes. With `HOST_SCALE=0.5`
+  it reports overruns from the first transfer, confirming it detects them.
+
+  A full run takes ~100 min, so it can start partway into the trace:
+  `START_REC=N` with `recs.txt`/`evs.txt` sliced from record N and
+  `ramimg.hex`/`ssimg.hex` (data RAM, SO, SP, stack) written by
+  `tools/iss.c` with `DUMP_AT=N`. The cache and loop buffer start cold. A
+  200k-record segment takes about 3 minutes.
+
+  Split-cache results, 200k records each: **1.6M, 3.2M, 4.8M, 6.4M, 7.8M —
+  0 overruns, 0 divergences.** The 3.2M segment covers the eviction episode
+  and the transfer that used to fail; the same segment on the pre-fix RTL
+  still reports the overrun at record 3,283,498, so the short runs do catch
+  it. A full `START_REC=0` run has not been done since the cache was
+  split.
 
 Pipeline (from `sd2snes_st0011/`):
 

@@ -10,8 +10,10 @@
 //
 // Structure, in the order a fetch is served:
 //   1. loop buffer   8 recent words in flip-flops, zero latency
-//   2. cache         4096-entry direct-mapped block RAM, prewarmed with
-//                    words 0..4095 after the firmware download
+//   2. pinned table  words 0..255 (every word used during DMA transfers),
+//                    block RAM, prewarmed after the firmware download
+//      cache         512-entry direct-mapped block RAM for all other words,
+//                    filled on demand (both looked up in parallel)
 //   3. SRAM          ~31 cycles per word (miss_latency_tb)
 //
 // No dependency on the core's RST: the MCU downloads the firmware (PGM_WR,
@@ -85,9 +87,9 @@ module upd77c25_extpgm (
   reg [6:0] hold_cnt;
   reg [1:0] post_cnt;
 
-  // On-chip cache of program words, direct-mapped on pc[CACHE_BITS-1:0], with
-  // the remaining pc bits as tag. A hit costs no SRAM access. Set CACHE_ENABLE
-  // to 0 to send every fetch to the SRAM (diagnostic builds only).
+  // Pinned table + general cache (see PINNED TABLE below). A hit costs no SRAM
+  // access. Set CACHE_ENABLE to 0 to send every fetch to the SRAM
+  // (diagnostic builds only).
   parameter CACHE_ENABLE = 1;
 
   // Throughput requires the cache: three sequential 45ns SRAM reads per word
@@ -97,36 +99,47 @@ module upd77c25_extpgm (
   // miss costs 60.5 cycles instead of 31 -- more than one DMA byte slot.
   parameter READ_VERIFY = 0;
 
-  // ---- LOOP BUFFER ------------------------------------------------------
+  // ---- LOOP BUFFER (off by default) -------------------------------------
+  //
+  // Kept at 0. It existed to protect the transfer loops from eviction, which
+  // the pinned table now does; over the full MesenCE trace 8 entries and 0
+  // give the same miss rate (8.0%). It is also expensive: LOOPBUF_ENTRIES
+  // associative 14-bit compares hang off pc and feed `ready` and the opcode
+  // decode, which was the failing mk2 path (TS_CLK21, -2.655 ns).
   //
   // Fully-associative buffer of recently fetched words, in flip-flops, checked
   // in parallel with the cache and hit with zero latency. It serves loops whose
-  // words are not in the cache: high-address code (above 4095, or aliasing
-  // onto pinned slots) runs at full speed after its first iteration. Inserts
+  // words collide in the 512-entry cache: they run at full speed after their
+  // first iteration. Inserts
   // only happen on demand fetches, so a resident loop stays resident.
   //
   // Sized 8: it is a combinational compare feeding `ready`, and the ST011
   // transfer loops are 4 words. 0 removes it.
-  parameter LOOPBUF_ENTRIES = 8;
+  parameter LOOPBUF_ENTRIES = 0;
   localparam LB_IDX = (LOOPBUF_ENTRIES <= 2) ? 1 : (LOOPBUF_ENTRIES <= 4) ? 2
                     : (LOOPBUF_ENTRIES <= 8) ? 3 : 4;
+  // Width used for declarations. At LOOPBUF_ENTRIES = 0 the vectors below
+  // would be [-1:0]; XST rejects that ("Xst:678 Can not evaluate constant"),
+  // so they keep one unused bit, which the generate blocks never write and
+  // synthesis folds away.
+  localparam LB_N = (LOOPBUF_ENTRIES == 0) ? 1 : LOOPBUF_ENTRIES;
 
   // Packed vectors, not arrays: `always @*` does not re-trigger on writes to
   // a Verilog memory in several simulators, so an array-based associative
   // lookup reads stale and never hits. Packed also keeps this in LUTs rather
   // than inferring a RAM, which is the point.
-  reg [14*LOOPBUF_ENTRIES-1:0] lb_tag;
-  reg [24*LOOPBUF_ENTRIES-1:0] lb_data;
-  reg [LOOPBUF_ENTRIES-1:0]    lb_val;
+  reg [14*LB_N-1:0] lb_tag;
+  reg [24*LB_N-1:0] lb_data;
+  reg [LB_N-1:0]    lb_val;
   reg [LB_IDX-1:0] lb_next;
   initial begin lb_tag=0; lb_data=0; lb_val=0; lb_next=0; end
 
   // XST rejects a variable index into a packed vector ("Variable index is
   // not supported in signal"), so both the lookup and the write are built
   // with generate/genvar -- every index is then constant at elaboration.
-  wire [LOOPBUF_ENTRIES-1:0] lb_match;
-  wire [LOOPBUF_ENTRIES-1:0] lb_first;
-  wire [23:0] lb_chain [0:LOOPBUF_ENTRIES];
+  wire [LB_N-1:0] lb_match;
+  wire [LB_N-1:0] lb_first;
+  wire [23:0] lb_chain [0:LB_N];
   assign lb_chain[0] = 24'd0;
 
   genvar lbg;
@@ -138,6 +151,11 @@ module upd77c25_extpgm (
       assign lb_first[lbg] = lb_match[lbg] & ~|(lb_match & ((1<<lbg)-1));
       assign lb_chain[lbg+1] = lb_chain[lbg]
                              | (lb_first[lbg] ? lb_data[24*lbg +: 24] : 24'd0);
+    end
+    // No entries: drive the unused bit so |lb_match is 0 rather than x.
+    if(LOOPBUF_ENTRIES == 0) begin : LB_NONE
+      assign lb_match = 1'b0;
+      assign lb_first = 1'b0;
     end
   endgenerate
 
@@ -211,40 +229,58 @@ module upd77c25_extpgm (
   reg [2:0] retry_cnt = 3'd0;
   reg [15:0] verify_errors = 16'd0; // mismatches seen (diagnostic counter)
 
-  localparam CACHE_BITS = 12; // 4096 entries
-  // 4096 entries (the largest that fits mk2) and identical on mk2 and mk3.
-  // Every word in the ST011 real-time transfer windows is below 256, inside
-  // the prewarmed range. Entry = valid(1) + tag(2) + data(24), packed as
-  // 18 + 9 bits, both native block RAM widths:
-  //     cache_data_lo  4096 x 18  {tag[1:0], data[15:0]}
-  //     cache_data_hi  4096 x  9  {valid,    data[23:16]}
-  // Invalidation and the power-on sweep clear HI.
-  localparam CACHE_TAG_BITS = 14 - CACHE_BITS; // 2 bits at 4096 entries
-                                                // (index+tag must cover
-                                                // pc's full 14 bits)
-  reg [CACHE_TAG_BITS+15:0] cache_data_lo [0:(1<<CACHE_BITS)-1];
-  reg [8:0]  cache_data_hi [0:(1<<CACHE_BITS)-1];
-  // [CACHE_TAG_BITS] = valid, [CACHE_TAG_BITS-1:0] = tag
+  // ---- PINNED TABLE + GENERAL CACHE ------------------------------------
+  //
+  // Two block RAMs, looked up in parallel from cache_raddr:
+  //
+  //   pin_data    256 x 25  {valid, word}          words 0..255 only
+  //   cache_data  512 x 30  {valid, tag[4:0], word} direct-mapped on pc[8:0],
+  //                                                 all other words
+  //
+  // Words 0..255 hold everything ST011 executes during a DMA transfer (0-2,
+  // 31, 197-200, 243-247). They are prewarmed into their own table after the
+  // download and nothing else can ever displace them. (With one shared
+  // cache, a routine at words 12485-12490 evicted the inbound transfer loop
+  // by aliasing, and the next transfer dropped a byte: the "freeze on
+  // capturing a piece", found with sim/replay_timed_tb.v.)
+  //
+  // The general cache holds everything else and is filled on demand. Words
+  // 256..511 index it with tag 0 and never collide with the pinned range.
+  // Modelled over the full MesenCE trace, this pair misses less (8.0%) than
+  // the previous single 4096-entry cache with pinning (10.2%) while using 2
+  // block RAMs instead of 6 on mk2. Tight loops that still miss run from the
+  // loop buffer after their first iteration.
+  localparam CACHE_BITS = 9;                   // 512 entries
+  localparam CACHE_TAG_BITS = 14 - CACHE_BITS; // 5
+  localparam PIN_BITS = 8;                     // 256 words
+  (* ram_style = "block" *)
+  reg [CACHE_TAG_BITS+24:0] cache_data [0:(1<<CACHE_BITS)-1];
+  (* ram_style = "block" *)
+  reg [24:0]                pin_data   [0:(1<<PIN_BITS)-1];
 
-  // Cache invalidation sweep: clears one entry per clock after configuration
-  // (Quartus will not unroll a 4096-iteration initial loop, and block RAM has
-  // no reset). Lives in the main always block so each array keeps one write
-  // port. Takes ~43us, long before the first fetch; cache_ready gates hits
-  // until it completes.
+  // Invalidation sweep: clears one general-cache entry and one pinned entry
+  // (init_addr[7:0]) per clock after configuration -- block RAM has no reset.
+  // Lives in the main always block so each array keeps one write port. Takes
+  // 512 cycles, long before the first fetch; cache_ready gates hits until then.
   reg [CACHE_BITS-1:0] init_addr = {CACHE_BITS{1'b0}};
   reg cache_ready = 1'b0;
 
-  // registered cache-read outputs, matching block RAM's synchronous-read
-  // behavior (address presented one cycle, data available the next)
-  // Single write port per cache array (lo_* / hi_*), applied at the end of
-  // the always block: block RAM is only inferred when an array has one
-  // write address expression. Blocking assignments, last one wins.
-  reg        hi_we;
-  reg [CACHE_BITS-1:0] hi_addr;
-  reg [8:0]  hi_data;
-  reg        lo_we;
-  reg [CACHE_BITS-1:0] lo_addr;
-  reg [CACHE_TAG_BITS+15:0] lo_data;
+  // Write requests, funnelled into one write port per array at the end of
+  // the always block (block RAM is only inferred with a single write address
+  // expression). Blocking assignments.
+  //   sweep_we  clear entry init_addr in both arrays
+  //   inv_we    firmware write to wr_addr_r: invalidate its entry
+  //   fill_we   fetched word fill_word for pc_r: pinned table if pc_r < 256,
+  //             else general cache
+  reg        sweep_we;
+  reg        inv_we;
+  reg        fill_we;
+  reg [23:0] fill_word;
+  reg                       c_we, p_we;     // resolved per-array write port
+  reg [CACHE_BITS-1:0]      c_addr;
+  reg [PIN_BITS-1:0]        p_addr;
+  reg [CACHE_TAG_BITS+24:0] c_val;
+  reg [24:0]                p_val;
 
   // ---- CACHE LOOKUP TIMING ------------------------------------------
   //
@@ -254,46 +290,32 @@ module upd77c25_extpgm (
   // on the first cycle of STATE_NEXT and a hit costs no stall cycles.
   wire [13:0] cache_raddr = pc_early_valid ? pc_early : pc;
 
-  reg [CACHE_TAG_BITS+15:0] cache_rdata_lo;
-  reg [8:0]  cache_rdata_hi;
-  reg [13:0] cache_q_pc = 14'h3fff; // address cache_rdata_* belongs to
-  // Read-during-write guard. The lookup registers are loaded from the
-  // array at the top of the always block while the fill/invalidate write
-  // lands at the bottom of the same block, so a lookup issued on the
-  // cycle its own entry is written captures the PRE-write contents.
-  // Believing that gives a hit on a just-invalidated entry -- caught by
-  // extpgm_tb's cycle-aligned cache/write hazard case. Flagged here and
-  // treated exactly like "not yet current": wait one cycle and re-check,
-  // by which time the lookup has re-read the post-write value.
+  reg [CACHE_TAG_BITS+24:0] cache_rdata_e;   // registered general-cache read
+  reg [24:0]                pin_rdata;       // registered pinned-table read
+  reg [13:0] cache_q_pc = 14'h3fff; // address both registered reads belong to
+  // Read-during-write guard. The registered reads are loaded at the top of
+  // the always block while writes land at the bottom, so a lookup issued on
+  // the cycle its own entry is written captures the PRE-write contents.
+  // Treated like "not yet current": wait one cycle and re-check. extpgm_tb
+  // has a cycle-aligned case for this.
   reg cache_q_dirty = 1'b0;
-  wire [23:0] cache_rdata = {cache_rdata_hi[7:0], cache_rdata_lo[15:0]};
+  wire cache_q_low = (cache_q_pc[13:PIN_BITS] == 0);
+  wire [23:0] cache_rdata = cache_q_low ? pin_rdata[23:0] : cache_rdata_e[23:0];
 
-  // Only believable when the registered lookup actually corresponds to
-  // the pc being asked about. For one cycle after any address change it
-  // does not, and the FSM must wait rather than treat it as a miss.
+  // Only believable when the registered lookup corresponds to the pc being
+  // asked about. For one cycle after an address change it does not, and the
+  // FSM must wait rather than treat it as a miss.
   wire cache_q_current = (cache_q_pc == pc) && !cache_q_dirty;
   wire cache_hit_now = (CACHE_ENABLE != 0)
-                   && cache_ready   // no hits until the sweep has cleared
-                                     // every entry; before that the tag
-                                     // memory holds undefined contents
+                   && cache_ready      // no hits until the sweep has run
                    && cache_q_current
-                   && cache_rdata_hi[8]                        // valid
-                   && (cache_rdata_lo[CACHE_TAG_BITS+15:16]
-                       == pc[13:CACHE_BITS]);                   // tag
+                   && (cache_q_low ? pin_rdata[24]                        // valid
+                                   : (cache_rdata_e[CACHE_TAG_BITS+24]    // valid
+                                      && (cache_rdata_e[CACHE_TAG_BITS+23:24]
+                                          == pc[13:CACHE_BITS])));       // tag
 
   reg [13:0] pc_r;          // pc the in-flight (or most recent) read is for
 
-  // ---- CACHE PINNING ----------------------------------------------------
-  // High words (pc >= 2^CACHE_BITS) may not overwrite cache slots
-  // 0..PIN_WORDS-1. Those slots hold every word ST011 executes inside a DMA
-  // transfer (0-2, 31, 197-200, 243-247). Without this, a routine at words
-  // 12485-12490 evicts slots 197-202 by aliasing; the next inbound transfer
-  // misses on its first pass, the DMA overwrites an unread byte and the DSP
-  // waits forever -- the "freeze on capturing a piece". Found with
-  // sim/replay_timed_tb.v. Pinned high words still use the loop buffer.
-  // Prewarm (low words only) and PGM_WR invalidation are unaffected.
-  parameter PIN_WORDS = 256;
-  wire fill_pinned = (pc_r[13:CACHE_BITS] != 0) && (pc_r[CACHE_BITS-1:0] < PIN_WORDS);
   reg [13:0] pc_last_done = 14'h3fff; // "never fetched" sentinel;
                                        // guaranteed mismatch vs pc=0
   reg [23:0] dout_r;        // last completed demand fetch
@@ -303,9 +325,9 @@ module upd77c25_extpgm (
   //
   // The first execution of any word costs a full external fetch (~31 cycles,
   // about one DMA byte slot), so a cold transfer loop drops a byte. Once the
-  // firmware download has gone quiet, words 0..(2^CACHE_BITS-1) are walked
-  // through the normal read path to fill the cache before the core may fetch.
-  // `ready` is held low meanwhile (~2.6ms, before the game first uses the DSP).
+  // firmware download has gone quiet, words 0..255 are walked through the
+  // normal read path into the pinned table before the core may fetch.
+  // `ready` is held low meanwhile (~0.2ms, before the game first uses the DSP).
   // PREWARM_ENABLE=0 removes it.
   parameter PREWARM_ENABLE = 1;
   localparam [15:0] PREWARM_WR_IDLE = 16'hffff; // ~0.68ms of no PGM_WR
@@ -313,7 +335,7 @@ module upd77c25_extpgm (
   reg prewarm_armed  = 1'b0;  // a download has been seen since last warm
   reg prewarm_active = 1'b0;
   reg prewarm_done   = 1'b0;
-  reg [CACHE_BITS-1:0] prewarm_addr = {CACHE_BITS{1'b0}};
+  reg [PIN_BITS-1:0] prewarm_addr = {PIN_BITS{1'b0}};
   reg prewarm_abort  = 1'b0;
   reg [15:0] wr_idle_cnt = 16'd0;
 
@@ -374,20 +396,18 @@ module upd77c25_extpgm (
      either way. Runs only when PGM_IN_PSRAM=1; otherwise this block is
      inert and the SRAM path below is used unchanged. */
   always @(posedge CLK) begin
-    hi_we = 1'b0;
-    hi_addr = {CACHE_BITS{1'b0}};
-    hi_data = 9'd0;
-    lo_we = 1'b0;              // default: no write this cycle
-    lo_addr = {CACHE_BITS{1'b0}};
-    lo_data = {(CACHE_TAG_BITS+16){1'b0}};
+    sweep_we  = 1'b0;          // defaults: no write this cycle
+    inv_we    = 1'b0;
+    fill_we   = 1'b0;
+    fill_word = 24'd0;
     if(PGM_IN_PSRAM != 0) begin
       // ---- PSRAM fetch path ----
       // Continuous cache lookup, same as the SRAM path below: `ready`
       // now consults cache_hit_now, so these registers must track a real
       // address on this path too rather than holding whatever they were
       // initialised to.
-      cache_rdata_lo <= cache_data_lo[cache_raddr[CACHE_BITS-1:0]];
-      cache_rdata_hi <= cache_data_hi[cache_raddr[CACHE_BITS-1:0]];
+      cache_rdata_e <= cache_data[cache_raddr[CACHE_BITS-1:0]];
+      pin_rdata     <= pin_data[cache_raddr[PIN_BITS-1:0]];
       cache_q_pc <= cache_raddr;
       // Firmware writes are still captured so the download path is
       // unaffected by where the program is read from.
@@ -399,7 +419,7 @@ module upd77c25_extpgm (
       // Cache invalidation sweep must run on this path too, or cache_ready
       // never asserts.
       if(!cache_ready) begin
-        hi_we = 1'b1; hi_addr = init_addr; hi_data = 9'd0;
+        sweep_we = 1'b1;
         if(init_addr == {CACHE_BITS{1'b1}}) cache_ready <= 1'b1;
         else init_addr <= init_addr + 1'b1;
       end
@@ -437,9 +457,7 @@ module upd77c25_extpgm (
             // path uses, so the CPU sees the same instruction either way
             dout_r <= {pword0[7:0], pword0[15:8], psram_din[7:0]};
             lb_insert(pc_r, {pword0[7:0], pword0[15:8], psram_din[7:0]});
-            lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
-            lo_data = {pc_r[13:CACHE_BITS], pword0[15:8], psram_din[7:0]};
-            hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, pword0[7:0]};
+            fill_we = 1'b1; fill_word = {pword0[7:0], pword0[15:8], psram_din[7:0]};
             pc_last_done <= pc_r;
             pstate <= P_IDLE;
           end
@@ -457,9 +475,9 @@ module upd77c25_extpgm (
     // cache_raddr -- see the CACHE LOOKUP TIMING note above. Read and
     // write of these arrays stay in this one always block so Quartus
     // still infers simple dual-port block RAM; the write port is the
-    // lo_we/hi_we funnel applied at the very end.
-    cache_rdata_lo <= cache_data_lo[cache_raddr[CACHE_BITS-1:0]];
-    cache_rdata_hi <= cache_data_hi[cache_raddr[CACHE_BITS-1:0]];
+    // sweep/inv/fill funnel applied at the very end.
+    cache_rdata_e <= cache_data[cache_raddr[CACHE_BITS-1:0]];
+    pin_rdata     <= pin_data[cache_raddr[PIN_BITS-1:0]];
     cache_q_pc <= cache_raddr;
 
     // capture write requests unconditionally, every cycle -- no RST gating,
@@ -487,7 +505,7 @@ module upd77c25_extpgm (
       // it lives in this always block rather than its own). One entry
       // per clock; the state machine is held off until it completes.
       // PGM_WR capture above still runs, so nothing is lost meanwhile.
-      hi_we = 1'b1; hi_addr = init_addr; hi_data = 9'd0;
+      sweep_we = 1'b1;
       if(init_addr == {CACHE_BITS{1'b1}}) cache_ready <= 1'b1;
       else init_addr <= init_addr + 1'b1;
     end else
@@ -540,7 +558,7 @@ module upd77c25_extpgm (
           // fetch: `ready` is gated by prewarm_active, so the core just
           // stalls until this finishes. See the PREWARM block above.
           prewarm_active <= 1'b1;
-          prewarm_addr <= {CACHE_BITS{1'b0}};
+          prewarm_addr <= {PIN_BITS{1'b0}};
           pc_r <= 14'd0;
           pc_r_byte0_r <= 17'd0;
           verify_pass <= 1'b0;
@@ -657,8 +675,8 @@ module upd77c25_extpgm (
           // A write landed: invalidate the last fetch result. (The DSP is held in
           // reset during download, so this is a safeguard.)
           pc_last_done <= 14'h3fff;
-          // and the cache slot (no tag check needed).
-          hi_we = 1'b1; hi_addr = wr_addr_r[CACHE_BITS-1:0]; hi_data = 9'd0;
+          // and its cache entry (no tag check needed).
+          inv_we = 1'b1;
           state <= S_IDLE;
         end else post_cnt <= post_cnt - 1;
       end
@@ -709,18 +727,16 @@ module upd77c25_extpgm (
           if(prewarm_active) begin
             // Prewarm word complete: fill the entry and step on. Bypasses
             // dout_r/pc_last_done (the core is stalled). Single read, no READ_VERIFY.
-            lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
-            lo_data = {pc_r[13:CACHE_BITS], byte1, ram_data_s2};
-            hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
+            fill_we = 1'b1; fill_word = {byte0, byte1, ram_data_s2};
             verify_pass <= 1'b0;
-            if(prewarm_addr == {CACHE_BITS{1'b1}}) begin
+            if(prewarm_addr == {PIN_BITS{1'b1}}) begin
               prewarm_active <= 1'b0;
               prewarm_done <= 1'b1;
             end else begin
               prewarm_addr <= prewarm_addr + 1'b1;
-              pc_r <= {{(14-CACHE_BITS){1'b0}}, prewarm_addr} + 14'd1;
-              pc_r_byte0_r <= {({{(14-CACHE_BITS){1'b0}}, prewarm_addr} + 14'd1), 1'b0}
-                            + ({{(14-CACHE_BITS){1'b0}}, prewarm_addr} + 14'd1);
+              pc_r <= {{(14-PIN_BITS){1'b0}}, prewarm_addr} + 14'd1;
+              pc_r_byte0_r <= {({{(14-PIN_BITS){1'b0}}, prewarm_addr} + 14'd1), 1'b0}
+                            + ({{(14-PIN_BITS){1'b0}}, prewarm_addr} + 14'd1);
             end
             state <= S_IDLE;
           end else if(vsum_active) begin
@@ -744,9 +760,7 @@ module upd77c25_extpgm (
             dout_r <= {byte0, byte1, ram_data_s2};
             pc_last_done <= pc_r;
             lb_insert(pc_r, {byte0, byte1, ram_data_s2});
-            lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
-            lo_data = {pc_r[13:CACHE_BITS], byte1, ram_data_s2};
-            hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
+            fill_we = 1'b1; fill_word = {byte0, byte1, ram_data_s2};
             state <= S_IDLE;
           end else if(!verify_pass) begin
             // First read of this word: stash it and read the same word
@@ -759,9 +773,7 @@ module upd77c25_extpgm (
             dout_r <= rd_word_a;
             pc_last_done <= pc_r;
             lb_insert(pc_r, rd_word_a);
-            lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
-            lo_data = {pc_r[13:CACHE_BITS], rd_word_a[15:0]};
-            hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, rd_word_a[23:16]};
+            fill_we = 1'b1; fill_word = {rd_word_a[23:16], rd_word_a[15:0]};
             verify_pass <= 1'b0;
             state <= S_IDLE;
           end else if(retry_cnt >= MAX_RETRY) begin
@@ -772,9 +784,7 @@ module upd77c25_extpgm (
             dout_r <= {byte0, byte1, ram_data_s2};
             pc_last_done <= pc_r;
             lb_insert(pc_r, {byte0, byte1, ram_data_s2});
-            lo_we = ~fill_pinned; lo_addr = pc_r[CACHE_BITS-1:0];
-            lo_data = {pc_r[13:CACHE_BITS], byte1, ram_data_s2};
-            hi_we = ~fill_pinned; hi_addr = pc_r[CACHE_BITS-1:0]; hi_data = {1'b1, byte0};
+            fill_we = 1'b1; fill_word = {byte0, byte1, ram_data_s2};
             verify_pass <= 1'b0;
             retry_cnt <= 3'd0;
             state <= S_IDLE;
@@ -794,15 +804,37 @@ module upd77c25_extpgm (
     endcase
     end
 
-    // THE single write port for cache_data_lo (see declaration above).
-    // One address expression, one data expression, one enable -- which
-    // is what block RAM inference requires.
-    if(lo_we) cache_data_lo[lo_addr] <= lo_data;
-    if(hi_we) cache_data_hi[hi_addr] <= hi_data;
-    // Evaluated here, at the end of the block, so lo_we/lo_addr already
-    // hold their final values for this cycle.
-    cache_q_dirty <= (lo_we && (lo_addr == cache_raddr[CACHE_BITS-1:0]))
-                  || (hi_we && (hi_addr == cache_raddr[CACHE_BITS-1:0]));
+    // Write ports: one address, one data, one enable per array.
+    // Sweep and invalidate write a cleared (valid=0) entry; the data bits of
+    // an invalid entry are don't-care.
+    begin
+      c_we = 1'b0; p_we = 1'b0;
+      c_addr = {CACHE_BITS{1'b0}}; p_addr = {PIN_BITS{1'b0}};
+      c_val = {(CACHE_TAG_BITS+25){1'b0}}; p_val = 25'd0;
+      if(sweep_we) begin
+        c_we = 1'b1; c_addr = init_addr;
+        p_we = 1'b1; p_addr = init_addr[PIN_BITS-1:0];
+      end else if(inv_we) begin
+        c_we = 1'b1; c_addr = wr_addr_r[CACHE_BITS-1:0];
+        p_we = (wr_addr_r[13:PIN_BITS] == 0); p_addr = wr_addr_r[PIN_BITS-1:0];
+      end else if(fill_we) begin
+        if(pc_r[13:PIN_BITS] == 0) begin
+          p_we = 1'b1; p_addr = pc_r[PIN_BITS-1:0]; p_val = {1'b1, fill_word};
+        end else begin
+          c_we = 1'b1; c_addr = pc_r[CACHE_BITS-1:0];
+          c_val = {1'b1, pc_r[13:CACHE_BITS], fill_word};
+        end
+      end
+      if(c_we) cache_data[c_addr] <= c_val;
+      if(p_we) pin_data[p_addr]   <= p_val;
+      // Deliberately pessimistic: any write this cycle marks the registered
+      // read stale, without comparing addresses. The address comparators used
+      // to sit behind the write-port priority mux and were the worst mk2 path
+      // (post_cnt -> cache_q_dirty, TS_CLK21 -2.209ns). The cost is one extra
+      // cycle on the rare lookup that coincides with a fill, a PGM_WR
+      // invalidate or the power-on sweep.
+      cache_q_dirty <= c_we || p_we;
+    end
   end
 
 endmodule

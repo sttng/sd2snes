@@ -106,7 +106,7 @@ parameter PREWARM_ENABLE = 1;
 
 // Entries in the fetch unit's fully-associative loop buffer (0 disables).
 // See the LOOP BUFFER note in upd77c25_extpgm.v.
-parameter LOOPBUF_ENTRIES = 8;
+parameter LOOPBUF_ENTRIES = 0;
 
 // Passed through to upd77c25_extpgm. 1 reads every missed word twice and
 // commits only on agreement. Keep 0: it doubles the cost of a cache miss
@@ -165,7 +165,7 @@ wire ext_pgm_busy_wr;
 // At 96MHz a cached instruction takes 6 cycles (62.5 ns), about 6 per byte
 // slot. SKIP_ALU2 and PC_LOOKAHEAD are what get it there. An external fetch
 // costs ~31 cycles, i.e. a whole slot, so the transfer code must never miss:
-// see PREWARM and CACHE PINNING in upd77c25_extpgm.v.
+// see PINNED TABLE and PREWARM in upd77c25_extpgm.v.
 wire [13:0] pc_next;        // combinational next-pc, valid in STATE_STORE
 wire pc_early_valid;
 
