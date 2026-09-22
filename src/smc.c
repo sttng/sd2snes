@@ -52,13 +52,19 @@ uint32_t hdr_addr[6] = {0xffb0, 0x101b0, 0x7fb0, 0x81b0, 0x40ffb0, 0x4101b0};
 uint8_t  smc_src_active = 0;
 uint32_t smc_src_base = 0;
 uint32_t smc_src_size = 0;
-/* smc_src_valid: how many bytes from smc_src_base are actually materialized and
-   safe to read for header scoring.  Equals smc_src_size for a full image, but is
-   SMALLER for the BPS header probe (only the first ~64 KB are materialized while
-   smc_src_size still carries the full logical target size for the fsize-based
-   branches).  Header slots that do not fit within smc_src_valid are rejected. */
 uint32_t smc_src_valid = 0;
-#define SMC_FSIZE() (smc_src_active ? smc_src_size : file_handle.fsize)
+
+/* Logical size of the currently opened ROM image.
+   Normally this equals file_handle.fsize.
+   SFROM overrides it with the embedded SNES ROM size. */
+static uint32_t smc_file_span = 0;
+
+void smc_set_file_span(uint32_t rom_size) {
+  smc_file_span = rom_size;
+}
+
+#define SMC_FSIZE() \
+  (smc_src_active ? smc_src_size : (smc_file_span ? smc_file_span : file_handle.fsize))
 static UINT smc_readblock(void* buf, uint32_t addr, uint16_t size, uint32_t file_offset) {
   if(smc_src_active) { sram_readblock(buf, smc_src_base + addr, size); return size; }
   return file_readblock(buf, addr + file_offset, size);
