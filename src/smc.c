@@ -524,10 +524,45 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
       }
   }
   
-  if (header->carttype == 0xcb) {
+  if(header->carttype == 0xcb) {
     // custom combo type.  supports all base mappers.  consider moving this to another field to support remaining mappers.
     props->has_combo = 1;
     props->fpga_features |= FEAT_COMBO;
+  }
+
+  /*
+   * Gamars Puzzle / Gamars Super DISK.
+   *
+   * The ROM itself is a normal 1 MiB LoROM image, but the original
+   * Gamars hardware provides a non-standard writable memory window.
+   *
+   * Software explicitly uses $31:6000-$31:61ff and also accesses the
+   * same storage through $41:6000-$41:61ff.
+   *
+   * Use mapper 4 in the BASE core.  Mapper 4 is otherwise unused by
+   * sd2snes_base (S-DD1 uses mapper_id 4 with its own FPGA core).
+   *
+   * Match the actual internal header rather than the bogus SRAM-size
+   * byte alone.  The original header contains:
+   *
+   *   name       "(C)GAMARS PUZZLE"
+   *   map        $20
+   *   carttype   $00
+   *   romsize    $0a (1 MiB)
+   *   ramsize    $20 (non-standard / invalid as Nintendo SRAM size)
+   *   checksum   $9e4d
+   *   complement $61b2
+   */
+  if(!props->fpga_conf
+     && SMC_FSIZE() == 0x100000
+     && !memcmp(header->name, "(C)GAMARS PUZZLE", 16)
+     && header->map == 0x20
+     && header->carttype == 0x00
+     && header->romsize == 0x0a
+     && header->ramsize == 0x20
+     && header->chk == 0x9e4d
+     && header->cchk == 0x61b2) {
+    props->mapper_id = 4;
   }
 
   /* $80-$9F boot remap for the listed LoROM slot carts (see smc_needs_bslorom).
@@ -557,6 +592,16 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
   if(props->ramsize_bytes < 2048) {
     props->ramsize_bytes = 0;
   }
+
+  /*
+   * Gamars Puzzle's header SRAM byte ($20) is not a Nintendo SRAM-size
+   * value.  The executable code demonstrably requires at least $200
+   * bytes at its special $31/$41:$6000 window.
+   */
+  if(props->mapper_id == 4 && !props->fpga_conf) {
+  props->ramsize_bytes = 0x200;
+  }
+
   props->region = (header->destcode <= 1 || header->destcode >= 13) ? 0 : 1;
 
   // adjust sram size for special cart types
