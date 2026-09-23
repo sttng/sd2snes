@@ -130,6 +130,14 @@ wire [7:0] MSU_SNES_DATA_IN;
 wire [7:0] MSU_SNES_DATA_OUT;
 wire [5:0] msu_status_reset_bits;
 wire [5:0] msu_status_set_bits;
+wire msu_volume_latch_out;
+wire msu_enable;
+wire msu_status_reset_we;
+wire msu_addr_reset;
+wire dac_play;
+wire dac_reset;
+wire dac_palmode_out;
+wire DBG_msu_address_ext_write_rising;
 wire [7:0] DMA_SNES_DATA_IN;
 wire [7:0] DMA_SNES_DATA_OUT;
 wire [7:0] CTX_SNES_DATA_IN;
@@ -434,23 +442,58 @@ sd_dma snes_sd_dma(
 assign SD_DMA_TO_ROM = (SD_DMA_STATUS && (SD_DMA_TGT == 2'b00));
 
 // ---------------------------------------------------------------------------
-// MSU-1 audio DAC not instantiated (no MSU-1 in this core). The DAC pins are
-// driven to a silent idle; DAC_STATUS is tied low. mcu_cmd.v's DAC registers
-// stay and are pruned by synthesis.
+// MSU-1 audio DAC and MSU-1 data interface (msu.v, dac.v from sd2snes_base).
+// Both are fed by the MCU's SD DMA: SD_DMA_TGT 01 = DAC buffer, 10 = MSU
+// data buffer. Block RAM: dac_buf 1 + msu_databuf 8 RAMB16 on mk2.
 // ---------------------------------------------------------------------------
-assign DAC_MCLK  = 1'b0;
-assign DAC_LRCK  = 1'b0;
-assign DAC_SDOUT = 1'b0;
-assign DAC_STATUS = 1'b0;   // 1-bit, per mcu_cmd.v's port
+dac snes_dac(
+  .clkin(CLK2),
+  .sysclk(SNES_SYSCLK),
+  .mclk_out(DAC_MCLK),
+  .lrck_out(DAC_LRCK),
+  .sdout(DAC_SDOUT),
+  .sclk_out(),
+  .we(SD_DMA_TGT==2'b01 ? SD_DMA_SRAM_WE : 1'b1),
+  .pgm_address(dac_addr),
+  .pgm_data(SD_DMA_SRAM_DATA),
+  .DAC_STATUS(DAC_STATUS),
+  .volume(msu_volumerq_out),
+  .vol_latch(msu_volume_latch_out),
+  .vol_select(dac_vol_select_out),
+  .palmode(dac_palmode_out),
+  .play(dac_play),
+  .reset(dac_reset),
+  .dac_address_ext(dac_ptr_addr)
+);
 
-// ---------------------------------------------------------------------------
-// MSU-1 not instantiated: no ST011 cart uses it, and its 8 RAMB16 / 16 M9K
-// are needed on mk2. The msu_* nets, address.v's msu_enable decode and
-// mcu_cmd.v's MSU registers remain (shared modules, pruned by synthesis);
-// the module's outputs are tied off here.
-// ---------------------------------------------------------------------------
-assign MSU_SNES_DATA_OUT = 8'h00;
-assign msu_status_out = 8'h00;
+msu snes_msu (
+  .clkin(CLK2),
+  .enable(msu_enable),
+  .pgm_address(msu_write_addr),
+  .pgm_data(SD_DMA_SRAM_DATA),
+  .pgm_we(SD_DMA_TGT==2'b10 ? SD_DMA_SRAM_WE : 1'b1),
+  .reg_addr(SNES_ADDR[2:0]),
+  .reg_data_in(MSU_SNES_DATA_IN),
+  .reg_data_out(MSU_SNES_DATA_OUT),
+  .reg_oe_falling(SNES_RD_start),
+  .reg_oe_rising(SNES_RD_end),
+  .reg_we_rising(SNES_WR_end),
+  .status_out(msu_status_out),
+  .volume_out(msu_volumerq_out),
+  .volume_latch_out(msu_volume_latch_out),
+  .addr_out(msu_addressrq_out),
+  .track_out(msu_trackrq_out),
+  .status_reset_bits(msu_status_reset_bits),
+  .status_set_bits(msu_status_set_bits),
+  .status_reset_we(msu_status_reset_we),
+  .msu_address_ext(msu_ptr_addr),
+  .msu_address_ext_write(msu_addr_reset),
+  .DBG_msu_reg_oe_rising(DBG_msu_reg_oe_rising),
+  .DBG_msu_reg_oe_falling(DBG_msu_reg_oe_falling),
+  .DBG_msu_reg_we_rising(DBG_msu_reg_we_rising),
+  .DBG_msu_address(DBG_msu_address),
+  .DBG_msu_address_ext_write_rising(DBG_msu_address_ext_write_rising)
+);
 
 wire CTX_WRQ;
 wire CTX_WORD;

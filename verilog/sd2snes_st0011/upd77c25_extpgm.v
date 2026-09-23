@@ -14,7 +14,7 @@
 //                    block RAM, prewarmed after the firmware download
 //      cache         512-entry direct-mapped block RAM for all other words,
 //                    filled on demand (both looked up in parallel)
-//   3. SRAM          ~31 cycles per word (miss_latency_tb)
+//   3. SRAM          ~32 cycles per word (miss_latency_tb)
 //
 // No dependency on the core's RST: the MCU downloads the firmware (PGM_WR,
 // $E9) while the DSP is held in reset, so this module must accept writes
@@ -79,7 +79,8 @@ module upd77c25_extpgm (
              S_WR_ADDR2   = 5'd7, S_WR_HOLD2 = 5'd8, S_WR_POST2 = 5'd9,
              S_RD_ADDR0   = 5'd10, S_RD_HOLD0 = 5'd11,
              S_RD_ADDR1   = 5'd12, S_RD_HOLD1 = 5'd13,
-             S_RD_ADDR2   = 5'd14, S_RD_HOLD2 = 5'd15;
+             S_RD_ADDR2   = 5'd14, S_RD_HOLD2 = 5'd15,
+             S_RD_CALC    = 5'd16;
 
   localparam POST_CYCLES = 2; // address/data hold margin after WE deasserts
 
@@ -96,7 +97,7 @@ module upd77c25_extpgm (
   // cannot keep up with ST011's DMA transfers (see upd77c25.v THROUGHPUT).
   // Read-verify: read each missed word twice, commit on agreement. Keep 0.
   // The SRAM path has been verified (16,384-word readback sweep), and at 1 a
-  // miss costs 60.5 cycles instead of 31 -- more than one DMA byte slot.
+  // miss costs 62 cycles instead of 32 -- more than one DMA byte slot.
   parameter READ_VERIFY = 0;
 
   // ---- LOOP BUFFER (off by default) -------------------------------------
@@ -323,7 +324,7 @@ module upd77c25_extpgm (
 
   // ---- ONE-SHOT CACHE PREWARM ----------------------------------------
   //
-  // The first execution of any word costs a full external fetch (~31 cycles,
+  // The first execution of any word costs a full external fetch (~32 cycles,
   // about one DMA byte slot), so a cold transfer loop drops a byte. Once the
   // firmware download has gone quiet, words 0..255 are walked through the
   // normal read path into the pinned table before the core may fetch.
@@ -600,10 +601,13 @@ module upd77c25_extpgm (
             lb_insert(pc, cache_rdata);
             state <= S_IDLE;
           end else begin
-            // Miss: external SRAM fetch.
+            // Miss: external SRAM fetch. pc*3 is computed from pc_r in
+            // S_RD_CALC, one cycle later: computing it from pc here put the
+            // core's next-pc mux (retimed by XST register balancing) in front
+            // of the adder, the worst mk2 path (TS_CLK21 -0.774ns). Costs one
+            // cycle per miss.
             pc_r <= pc;
-            pc_r_byte0_r <= {pc, 1'b0} + pc;
-            state <= S_RD_ADDR0;
+            state <= S_RD_CALC;
           end
         end
       end
@@ -635,7 +639,7 @@ module upd77c25_extpgm (
       end
       // ---- write byte 1 (bits 15:8) ----
       S_WR_ADDR1: begin
-        RAM_ADDR <= {2'b0, wr_addr_r_byte0} + 19'd1;
+        RAM_ADDR <= {2'b0, RAM_ADDR[16:0] + 17'd1}; // = byte0 + 1 (set in S_WR_ADDR0)
         ram_data_out <= wr_data_r[15:8];
         RAM_WE <= 1'b1;
         hold_cnt <= HOLD_CYCLES;
@@ -655,7 +659,7 @@ module upd77c25_extpgm (
       end
       // ---- write byte 2 (bits 23:16) ----
       S_WR_ADDR2: begin
-        RAM_ADDR <= {2'b0, wr_addr_r_byte0} + 19'd2;
+        RAM_ADDR <= {2'b0, RAM_ADDR[16:0] + 17'd1}; // = byte0 + 2
         ram_data_out <= wr_data_r[23:16];
         RAM_WE <= 1'b1;
         hold_cnt <= HOLD_CYCLES;
@@ -686,6 +690,10 @@ module upd77c25_extpgm (
       // OE is asserted once and held low across all three bytes: only the address
       // changes, so the bus never floats between bytes and each byte needs only
       // address-access time.
+      S_RD_CALC: begin
+        pc_r_byte0_r <= {pc_r, 1'b0} + pc_r;
+        state <= S_RD_ADDR0;
+      end
       S_RD_ADDR0: begin
         RAM_ADDR <= {2'b0, pc_r_byte0};
         RAM_OE <= 1'b0; // assert once, stays low for the whole word
@@ -700,7 +708,7 @@ module upd77c25_extpgm (
         end else hold_cnt <= hold_cnt - 1;
       end
       S_RD_ADDR1: begin
-        RAM_ADDR <= {2'b0, pc_r_byte0} + 19'd1;
+        RAM_ADDR <= {2'b0, RAM_ADDR[16:0] + 17'd1}; // = byte0 + 1 (set in S_RD_ADDR0)
         RAM_OE <= 1'b0; // held -- no float between bytes
         hold_cnt <= HOLD_CYCLES;
         state <= S_RD_HOLD1;
@@ -713,7 +721,7 @@ module upd77c25_extpgm (
         end else hold_cnt <= hold_cnt - 1;
       end
       S_RD_ADDR2: begin
-        RAM_ADDR <= {2'b0, pc_r_byte0} + 19'd2;
+        RAM_ADDR <= {2'b0, RAM_ADDR[16:0] + 17'd1}; // = byte0 + 2
         RAM_OE <= 1'b0; // held
         hold_cnt <= HOLD_CYCLES;
         state <= S_RD_HOLD2;
