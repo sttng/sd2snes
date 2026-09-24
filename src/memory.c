@@ -49,6 +49,7 @@ memory.c: RAM operations
 #include "cli.h"
 #include "cheat.h"
 #include "igmenu.h"
+#include "trainer.h"
 #include "manual.h"
 #include "rtc.h"
 #include "savestate.h"
@@ -371,7 +372,7 @@ static void load_stream(const load_ctx_t *c) {
     file_open(filename, FA_READ);
     ff_sd_offload=1;
     sd_offload_tgt=0;
-    f_lseek(&file_handle, romprops.offset);
+    f_lseek(&file_handle, c->file_offset + romprops.offset);
     uint32_t total_bytes_read = 0;
     for(;;) {
       ff_sd_offload=1;
@@ -557,26 +558,32 @@ static uint8_t load_apply_patch(const load_ctx_t *c) {
   return patch_ok;
 }
 
-/* The FPGA core, mapper and masks were all selected from the PRE-patch
+/* The FPGA core, chip mode, mapper and masks were all selected from the PRE-patch
    header (smc_id ran on the unpatched file before fpga_pgm).  If the patch
    changed the cartridge type (e.g. an SA-1 / Super FX conversion hack), the
-   wrong core is currently loaded and the game would boot broken.
-   Re-derive the cartridge from the now-patched image in SDRAM; if it needs a
-   different core, reload+repatch once under the correct core.  Reconfiguring
-   the FPGA wipes SDRAM, so a full reload (re-stream + re-patch) is required
-   rather than a bare fpga_pgm.  Guarded so the normal path (no patch, or a
-   patch that keeps the same core) is completely unaffected.
+   game would boot broken.
+   Re-derive the cartridge from the now-patched image; if it needs a different
+   core, or a different chip mode on the same core, load_rom reloads once with
+   the patched cartridge.  With RECORE_PSRAM_KEEP the patched image survives the
+   fpga_pgm and the reload only re-checks it (recore_rom_fingerprint); without
+   it, or when that check fails, the reload re-streams and re-patches.  A patch
+   that keeps both the core and the chip mode never reloads.
 
-   Returns 1 when the caller must reload under the new core (the recore state is armed
-   on the way out); 0 when the core stands. */
+   Returns 1 when the caller must reload (the recore state is armed on the way
+   out); 0 when the core stands. */
 static uint8_t load_patch_needs_recore(const load_ctx_t *c, uint8_t saved_ips_idx) {
   smc_id_sdram(&ips_recore_props, SRAM_ROM_ADDR + romprops.load_address,
                romprops.romsize_bytes);
   const uint8_t* core_now = romprops.fpga_conf ? romprops.fpga_conf : FPGA_BASE;
   const uint8_t* core_new = ips_recore_props.fpga_conf ? ips_recore_props.fpga_conf
                                                        : FPGA_BASE;
-  if(core_new != core_now) {
-    printf("IPS: patch changed cartridge type -> reloading under correct core\n");
+  /* The chip mode can change without the core file: on the Mk.III a Super FX 3 cart
+     runs on fpga_gsu like a classic GSU, and only fpga_dspfeat bit 1 (written by
+     load_set_features from the pre-patch header) turns FX3 on.  has_fx3 also keeps
+     the in-game hooks off (cheat.c).  The Mk.II moves FX3 to fpga_gsu3, so there
+     the core comparison already catches it. */
+  if(core_new != core_now || ips_recore_props.has_fx3 != romprops.has_fx3) {
+    printf("IPS: patch changed cartridge type -> reloading\n");
     ips_recore_active = 1;
 #if RECORE_PSRAM_KEEP
     /* copier-swap: patch already applied under base -> pass 2 skips stream+patch
@@ -595,11 +602,12 @@ static uint8_t load_patch_needs_recore(const load_ctx_t *c, uint8_t saved_ips_id
      most commonly a HiROM -> ExHiROM promotion when an expansion grows the
      ROM past 4 MB (e.g. Bahamut Lagoon English: 3 MB HiROM -> 8 MB ExHiROM,
      Tales of Phantasia-style).  set_mapper() ran before the patch with the
-     PRE-patch mapper, and the core-change branch above only fires on a core
-     swap, so a same-core mapper change would otherwise leave an 8 MB ExHiROM
-     image addressed as 4 MB HiROM -> the SNES reads garbage and black-
-     screens.  The core is already correct and the ROM mask was expanded
-     above, so just re-program the FPGA mapper register here (no reload). */
+     PRE-patch mapper, and the reload condition of load_patch_needs_recore
+     only looks at the core and the chip mode, so a same-core mapper change
+     would otherwise leave an 8 MB ExHiROM image addressed as 4 MB HiROM ->
+     the SNES reads garbage and black-screens.  The core is already correct
+     and load_apply_patch expanded the ROM mask, so just re-program the FPGA
+     mapper register here (no reload). */
   if(ips_recore_props.mapper_id != romprops.mapper_id) {
     printf("IPS: patch changed mapper %d -> %d (same core) -> reprogramming FPGA mapper\n",
            romprops.mapper_id, ips_recore_props.mapper_id);
@@ -783,6 +791,8 @@ static void load_set_features(const load_ctx_t *c) {
 }
 /* Chip BIOSes and firmware blobs the staged ROM needs: BS-X, Sufami Turbo, DSPx.
    Takes ticksstart only to close out the load timer printed here. */
+static uint8_t load_st018(const uint8_t *filename);
+
 static void load_stage_bios(tick_t ticksstart) {
   tick_t ticks_total=0;
   printf("rom header map: %02x; mapper id: %d\n", romprops.header.map, romprops.mapper_id);
@@ -831,6 +841,12 @@ static void load_stage_bios(tick_t ticksstart) {
       snes_menu_errmsg(MENU_ERR_SUPPLFILE, (void*)romprops.dsp_fw);
     }
   }
+  if(romprops.has_st0018) {
+    printf("ST018 game. Loading firmware image %s...\n", romprops.dsp_fw);
+    if(!load_st018(romprops.dsp_fw)) {
+      snes_menu_errmsg(MENU_ERR_SUPPLFILE, (void*)romprops.dsp_fw);
+    }
+  }
 }
 
 /* Size the ROM/SaveRAM windows for the FPGA and hand every console-specific stager
@@ -846,28 +862,38 @@ static void load_setup_masks(load_ctx_t *c) {
   }
 
   if (romprops.has_sa1 && romprops.header.carttype == 0x36 && romprops.header.ramsize) {
-    // move iram into saveram for special carts with no bwram
-    romprops.header.ramsize = 1;
-    romprops.ramsize_bytes = 0x800;
-    // override any changes to this so we capture full sram
-    romprops.srambase       = 0;
-    romprops.sramsize_bytes = romprops.ramsize_bytes;
-    rammask = 1;
+  // move iram into saveram for special carts with no bwram
+  romprops.header.ramsize = 1;
+  romprops.ramsize_bytes = 0x800;
+  // override any changes to this so we capture full sram
+  romprops.srambase       = 0;
+  romprops.sramsize_bytes = romprops.ramsize_bytes;
+  rammask = 1;
   } else if(romprops.has_sufami) {
-    /* MAPPED size, deliberately NOT the saveable size: the ST BIOS uses Slot A SaveRAM
-       as scratch and dispatches into it (below $8000), so the window must exist even
-       for a cart with no battery. sramsize_bytes stays 0 there, and that is the field
-       the autosave and the .srm writer key off. */
-    rammask = (romprops.ramsize_bytes > SUFAMI_SLOTA_SCRATCH_SIZE
-               ? romprops.ramsize_bytes : SUFAMI_SLOTA_SCRATCH_SIZE) - 1;
-  } else if(romprops.header.ramsize == 0) {
+  /* MAPPED size, deliberately NOT the saveable size: the ST BIOS uses Slot A SaveRAM
+     as scratch and dispatches into it (below $8000), so the window must exist even
+     for a cart with no battery. sramsize_bytes stays 0 there, and that is the field
+     the autosave and the .srm writer key off. */
+  rammask = (romprops.ramsize_bytes > SUFAMI_SLOTA_SCRATCH_SIZE
+             ? romprops.ramsize_bytes : SUFAMI_SLOTA_SCRATCH_SIZE) - 1;
+   } else if(romprops.mapper_id == 4 && !romprops.fpga_conf) {
+   /*
+    * Gamars Puzzle.
+    *
+    * Header SRAM size is deliberately non-standard ($20), so don't use
+    * header.ramsize to decide whether a RAM window exists.
+    *
+    * smc_id() forces ramsize_bytes/sramsize_bytes to $200 for this ROM.
+    */
+   rammask = romprops.ramsize_bytes - 1;
+   } else if(romprops.header.ramsize == 0) {
     rammask = 0;
-  } else {
-    rammask = romprops.ramsize_bytes - 1;
-  }
-  rommask = romprops.romsize_bytes - 1;
+   } else {
+     rammask = romprops.ramsize_bytes - 1;
+   }
+    rommask = romprops.romsize_bytes - 1;
   
-  if (romprops.has_combo) {
+   if (romprops.has_combo) {
     ramslot = sram_readbyte((romprops.mapper_id == 0 || romprops.mapper_id == 2) ? 0xFFDA : 0x7FDA);
   }
   
@@ -1001,6 +1027,77 @@ static uint32_t load_reopen_player(uint8_t *filename, uint8_t flags, const char 
   return 1;
 }
 
+/* SFROM logical ROM extractor.
+   Returns 1 when filename is an SFROM and fills rom_offset/rom_size.
+   Returns 0 for a normal ROM or an invalid SFROM. */
+
+static uint32_t rd32le(const uint8_t *p) {
+  return (uint32_t)p[0]
+       | ((uint32_t)p[1] << 8)
+       | ((uint32_t)p[2] << 16)
+       | ((uint32_t)p[3] << 24);
+}
+
+static uint8_t load_sfrom_info(uint32_t *rom_offset,
+                               uint32_t *rom_size,
+                               uint32_t physical_size) {
+  uint8_t hdr[0x50];
+  UINT br;
+
+  if(file_res) return 0;
+
+  if(f_lseek(&file_handle, 0) != FR_OK)
+    return 0;
+
+  if(f_read(&file_handle, hdr, sizeof(hdr), &br) != FR_OK || br < 0x30)
+    return 0;
+
+  /* SFROM magic */
+  if(rd32le(hdr + 0x00) != 0x00000100)
+    return 0;
+
+  uint32_t declared_size = rd32le(hdr + 0x04);
+  uint32_t offset        = rd32le(hdr + 0x08);
+  uint32_t footer        = rd32le(hdr + 0x14);
+
+  if(offset >= physical_size)
+    return 0;
+
+  if(declared_size && declared_size > physical_size)
+    return 0;
+
+  uint32_t size = 0;
+
+  /* Standard Nintendo 0x30-header layout:
+     ROM size lives in the footer at footer+1. */
+  if(footer && footer < physical_size && footer + 5 <= physical_size) {
+    uint8_t foot[5];
+
+    if(f_lseek(&file_handle, footer) != FR_OK)
+      return 0;
+
+    if(f_read(&file_handle, foot, sizeof(foot), &br) != FR_OK || br != sizeof(foot))
+      return 0;
+
+    size = rd32le(foot + 1);
+  }
+
+  /* Common 0x50 conversion layout:
+     ROM size stored inline at 0x31. */
+  if(!size && br >= 0x35)
+    size = rd32le(hdr + 0x31);
+
+  if(!size)
+    return 0;
+
+  if(offset + size > physical_size)
+    return 0;
+
+  *rom_offset = offset;
+  *rom_size   = size;
+  return 1;
+}
+
 /* Open the picked file and take its size + combo slot.  0 = aborted (NACKed). */
 static uint32_t load_open(load_ctx_t *c) {
   uint8_t *filename = c->filename;
@@ -1010,17 +1107,43 @@ static uint32_t load_open(load_ctx_t *c) {
 
   printf("%s\n", filename);
   file_open(filename, FA_READ);
-  if(file_res) {
-    uart_putc('?');
-    uart_putc(0x30+file_res);
-    /* ROM vanished/SD glitch between selection and load: populate the error
-       region so the menu's popup names this file instead of showing stale bytes
-       from a previous abort (the main.c epilogue NACKs on a 0 return either way). */
-    return load_abort_missing(flags, MENU_ERR_FS, path_leaf((const char*)filename));
-  }
-  c->filesize = file_handle.fsize; // won't be correct for combo roms
+if(file_res) {
+  uart_putc('?');
+  uart_putc(0x30+file_res);
 
-  if(flags & LOADROM_WITH_COMBO) {
+  return load_abort_missing(flags,
+                            MENU_ERR_FS,
+                            path_leaf((const char*)filename));
+}
+
+c->filesize = file_handle.fsize;
+c->file_offset = 0;
+
+/* SFROM container support */
+{
+  const char *dot = strrchr((const char*)filename, '.');
+
+  if(dot && !strcasecmp(dot + 1, "sfrom")) {
+    uint32_t rom_off;
+    uint32_t rom_size;
+
+    if(!load_sfrom_info(&rom_off, &rom_size, file_handle.fsize)) {
+      file_close();
+      return load_abort_missing(flags,
+                                MENU_ERR_FS,
+                                path_leaf((const char*)filename));
+    }
+
+    c->file_offset = rom_off;
+    c->filesize    = rom_size;
+
+    printf("SFROM: rom offset=%lx size=%lx\n",
+           rom_off,
+           rom_size);
+  }
+}
+
+if(flags & LOADROM_WITH_COMBO) {
     printf("Combo Header Check...");
     // seek to the proper slot.  slots are naturally aligned on 1MB boundaries.
     c->file_offset = 0x100000 * snescmd_readbyte(SNESCMD_MCU_CMD + 1);
@@ -1138,7 +1261,8 @@ static uint32_t load_stage_consoles(load_ctx_t *c) {
    correct what the header of its player faked.  0 = aborted (NACKed). */
 static uint32_t load_identify(load_ctx_t *c) {
   uint8_t flags = c->flags;
-  c->filesize = file_handle.fsize;
+
+  smc_set_file_span(c->filesize);
   smc_id(&romprops, c->file_offset);
   /* the player is a plain LoROM; force the SMS core + drop any chip the header faked */
   if (sms_active) {
@@ -1218,7 +1342,7 @@ static uint32_t load_check_prereqs(load_ctx_t *c) {
   uint8_t  *filename = c->filename;
   DWORD     filesize = c->filesize;
   uint8_t   flags    = c->flags;
-  /* unimplemented chip (ST0011/ST0018/SPC7110): smc_id already flagged it */
+  /* unimplemented chip: smc_id already flagged it */
   if(romprops.error == MENU_ERR_NOIMPL) {
     return load_abort_missing(flags, MENU_ERR_NOIMPL, (char*)romprops.error_param);
   }
@@ -1237,6 +1361,10 @@ static uint32_t load_check_prereqs(load_ctx_t *c) {
       return load_abort_missing(flags, MENU_ERR_SUPPLFILE,
                                 path_leaf((const char*)romprops.dsp_fw));
     }
+  }
+  /* ST018 firmware: 160 KB, streamed into the Bus 2 SRAM by load_st018(). */
+  if(romprops.has_st0018 && !file_exists((const char*)DSPFW_ST0018)) {
+    return load_abort_missing(flags, MENU_ERR_SUPPLFILE, path_leaf((const char*)DSPFW_ST0018));
   }
   /* The .st has no reset vector of its own: the BIOS boots and jumps into the slot. */
   if(romprops.has_sufami && !file_exists((const char*)STBIOS_FW)) {
@@ -1540,6 +1668,10 @@ void init(uint8_t *filename) {
   /* Stage the in-game TAB menu bin (igmenu.bin) into PSRAM $C2 for real game loads
      only (not a menu reload -- the $C2 dir buffer is the menu's own scratch there).
      Bounded + fail-safe: a missing/bad bin just leaves IGMENU_GATE 0 (single-tab). */
+  /* Drop any RAM-trainer session and its pins on EVERY load, the menu included: the
+     cheat_program() below emits frozen pins into the NMI hook, and a stale one from the
+     previous game must never reach the menu or the next ROM. */
+  trainer_stage();
   if (filename != (uint8_t *)MENU_FILENAME) {
     igmenu_stage();
     /* Stage the SAVES-tab status block for the in-game menu (game load only). */
@@ -2116,7 +2248,74 @@ void sram_memset(uint32_t base_addr, uint32_t len, uint8_t val) {
   FPGA_DESELECT();
 }
 
-void load_dspx(const uint8_t *filename, uint8_t coretype) {
+/* ST018 (fpga_st0018 core): stream st018.rom -- 128 KB ARM program ROM
+   followed by 32 KB data ROM -- into the Bus 2 SRAM while the ARM is held in
+   reset, then let the FPGA read the whole image back and compare checksums.
+   The image is one byte per $e9 parameter byte; MCU_RDY (FPGA_WAIT_RDY)
+   paces the SRAM writes and also covers the cache invalidation that $e8
+   starts. One retry on a verify mismatch. Returns 1 when the image in the
+   SRAM is verified. The ARM is released later by deassert_reset(). */
+static uint8_t load_st018(const uint8_t *filename) {
+  for(uint8_t attempt = 0; attempt < 2; attempt++) {
+    UINT bytes_read;
+    uint32_t total = 0, sum = 0, fsum = 0;
+    uint8_t busy = 1;
+    uint16_t polls = 0;
+
+    file_open((uint8_t*)filename, FA_READ);
+    if(file_res) {
+      printf("Could not read %s: error %d\n", filename, file_res);
+      return 0;
+    }
+    if(file_handle.fsize != ST0018_FW_SIZE) {
+      printf("%s: %lu bytes, expected %lu -- not an ST018 image\n", filename,
+             (unsigned long)file_handle.fsize, (unsigned long)ST0018_FW_SIZE);
+      file_close();
+      return 0;
+    }
+
+    fpga_dspx_reset(1);          /* hold the ARM (loader is gated on it) */
+    fpga_reset_dspx_addr();      /* $e8: pointer = 0, invalidate ROM cache */
+
+    FPGA_SELECT();
+    FPGA_TX_BYTE(FPGA_CMD_DSPWRITEPGM);
+    while((bytes_read = file_read()) != 0) {
+      for(UINT i = 0; i < bytes_read; i++) {
+        FPGA_TX_BYTE(file_buf[i]);
+        FPGA_WAIT_RDY_INLINE();
+        sum += file_buf[i];
+      }
+      total += bytes_read;
+      if(total >= ST0018_FW_SIZE) break;
+    }
+    FPGA_DESELECT();
+    file_close();
+    if(total != ST0018_FW_SIZE) {
+      printf("%s: short read (%lu bytes)\n", filename, (unsigned long)total);
+      return 0;
+    }
+
+    fpga_st018_vsum_start();
+    delay_ms(2);
+    while(busy && polls++ < 100) {
+      delay_ms(1);
+      busy = fpga_st018_vsum_read(&fsum);
+    }
+    if(!busy && fsum == sum) {
+      printf("ST018 firmware loaded and verified (sum %08lx)\n", (unsigned long)sum);
+      return 1;
+    }
+    printf("ST018 firmware verify FAILED (attempt %d): FPGA %08lx, file %08lx%s\n",
+           attempt + 1, (unsigned long)fsum, (unsigned long)sum, busy ? ", sweep timed out" : "");
+  }
+  return 0;
+}
+
+void load_dspx(const uint8_t *filename, uint16_t coretype) {
+  /* coretype is uint16_t, NOT uint8_t: fpga_features is 16 bits and
+     FEAT_ST0011 is bit 14. Narrowing it here silently passed 0 and hit the
+     "unknown core" path, loading no firmware at all. FEAT_ST0010 (bit 1)
+     and FEAT_DSPX (bit 0) fit in 8 bits, which is why this went unnoticed. */
   UINT bytes_read;
   uint16_t word_cnt;
   uint8_t wordsize_cnt = 0;
@@ -2127,7 +2326,14 @@ void load_dspx(const uint8_t *filename, uint8_t coretype) {
   uint32_t pgmdata = 0;
   uint16_t datdata = 0;
 
-  if(coretype & FEAT_ST0010) {
+  if(romprops.has_st0011) {
+    /* ST011: uPD96050 geometry -- 16384 words of 24-bit program (48KB)
+       and 2048 words of 16-bit data ROM (4KB). Keyed on has_st0011
+       rather than a featurebit because ST010 and ST011 share
+       FEAT_ST0010; they are told apart by core, not by bit. */
+    datsize = 2048;
+    pgmsize = 16384;
+  } else if (coretype & FEAT_ST0010) {
     datsize = 1536;
     pgmsize = 2048;
   } else if (coretype & FEAT_DSPX) {

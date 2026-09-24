@@ -52,13 +52,19 @@ uint32_t hdr_addr[6] = {0xffb0, 0x101b0, 0x7fb0, 0x81b0, 0x40ffb0, 0x4101b0};
 uint8_t  smc_src_active = 0;
 uint32_t smc_src_base = 0;
 uint32_t smc_src_size = 0;
-/* smc_src_valid: how many bytes from smc_src_base are actually materialized and
-   safe to read for header scoring.  Equals smc_src_size for a full image, but is
-   SMALLER for the BPS header probe (only the first ~64 KB are materialized while
-   smc_src_size still carries the full logical target size for the fsize-based
-   branches).  Header slots that do not fit within smc_src_valid are rejected. */
 uint32_t smc_src_valid = 0;
-#define SMC_FSIZE() (smc_src_active ? smc_src_size : file_handle.fsize)
+
+/* Logical size of the currently opened ROM image.
+   Normally this equals file_handle.fsize.
+   SFROM overrides it with the embedded SNES ROM size. */
+static uint32_t smc_file_span = 0;
+
+void smc_set_file_span(uint32_t rom_size) {
+  smc_file_span = rom_size;
+}
+
+#define SMC_FSIZE() \
+  (smc_src_active ? smc_src_size : (smc_file_span ? smc_file_span : file_handle.fsize))
 static UINT smc_readblock(void* buf, uint32_t addr, uint16_t size, uint32_t file_offset) {
   if(smc_src_active) { sram_readblock(buf, smc_src_base + addr, size); return size; }
   return file_readblock(buf, addr + file_offset, size);
@@ -124,6 +130,8 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
   props->has_spc7110_rtc = 0;
   props->has_cx4 = 0;
   props->has_obc1 = 0;
+  props->has_obc1 = 0;
+  props->has_col20 = 0;
   props->has_gsu = 0;
   props->has_fx3 = 0;
   props->has_sa1 = 0;
@@ -171,7 +179,38 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
       return;
     }
   }
-
+  /* Korean "Super 20 in 1" LoROM pirate multicart: 32 banks of 32KB, no valid
+   header on bank 0 (menu/launcher code). Detected by the embedded LoROM
+   header MAME's sns_rom_20col_device documents on bank 6 (Spartan X),
+   byte-identical across the known dump. Needs its own FPGA core
+   (sd2snes_col20) because the bank-select register at $808000 is live,
+   write-triggered state the base LoROM decode has no room for -- see
+   verilog/sd2snes_col20/col20.v. */
+{
+  static const uint8_t col20_bank6_hdr[32] = {
+    0x53, 0x70, 0x61, 0x72, 0x74, 0x61, 0x6e, 0x20,   /* "Spartan " */
+    0x58, 0x20, 0x53, 0x66, 0x63, 0x20, 0x20, 0x20,   /* "X Sfc   " */
+    0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x00, 0x08,
+    0x00, 0x0d, 0x01, 0x01, 0xff, 0xff, 0x00, 0x00
+  };
+  uint8_t col20_hdr[32];
+  smc_readblock(col20_hdr, 0x37fc0, sizeof(col20_hdr), file_offset);
+  if(!memcmp(col20_hdr, col20_bank6_hdr, sizeof(col20_hdr))) {
+    memset(header, 0, sizeof(snes_header_t));
+    props->mapper_id        = 1;             /* LoROM -- MAPPER input to the core is still 3'b001 */
+    props->offset           = 0;
+    props->header_address   = 0;
+	props->has_col20        = 1;
+    props->fpga_conf        = FPGA_COL20;
+    props->fpga_features    = 0;             /* this core doesn't consume featurebits */
+    props->romsize_bytes    = 0x100000;      /* fixed -- this cart is always exactly 1MB */
+    props->ramsize_bytes    = 0;
+    props->expramsize_bytes = 0;
+    props->sramsize_bytes   = 0;
+    props->srambase         = 0;
+	return;
+  }
+}
   /* Nintendo event carts (Campus Challenge '92 / PowerFest '94), also tested
      before header scoring: the 256 KB multi-game menu chip carries no valid SNES
      header ($7FC0 is code, and one PowerFest score hack even has a donor game's
@@ -338,18 +377,34 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
       /* ST0011 LoROM */
       else if (header->map == 0x30 && header->carttype == 0xf6 && header->romsize < 0xa) {
         props->has_dspx = 1;
+        /* uPD96050 family: identical FPGA-side bus decode, external-fetch
+           path, SaveRAM sizing and savestate limitations as ST0010 (see
+           savestate.c's dsp_ok check, which gates on has_st0010) -- only
+           the firmware filename and the core differ.
+           FEAT_ST0010 is the "uPD96050 present" bit and ST011 sets it too;
+           the ST010/ST011 split is by CORE (fpga_dsp vs fpga_st0011), not
+           by featurebit. There is no free bit to split them with -- see
+           the note in fpga_spi.h. ST010 keeps fpga_dsp and is untouched. */
         props->has_st0011 = 1;
         props->dsp_fw = DSPFW_ST0011;
-        props->fpga_conf = FPGA_DSP;
-       // props->fpga_features |= FEAT_ST0011;
-        props->error = MENU_ERR_NOIMPL;
-        props->error_param = (uint8_t*)"ST0011";
+        props->fpga_conf = FPGA_ST0011;
+        props->fpga_features |= FEAT_ST0010;
+        header->ramsize = 2;
       }
       /* ST0018 LoROM */
       else if (header->map == 0x30 && header->carttype == 0xf5) {
-        props->has_st0011 = 1;
-        props->error = MENU_ERR_NOIMPL;
-        props->error_param = (uint8_t*)"ST0018";
+        /* ST0018 is an ARM core, unrelated to the uPD96050 -- it must not
+           set has_st0011 or has_dspx (those select the uPD96050 core and
+           its word-oriented firmware loader). It gets its own core,
+           fpga_st0018, which carries an ARMv3 CPU and runs the 160 KB
+           st018.rom out of the Bus 2 SRAM (loaded by load_st018()).
+           No featurebit: the core alone identifies the chip -- all 16
+           bits are allocated (see fpga_spi.h), the same reason ST010 and
+           ST011 are told apart by core. Savestates stay off automatically:
+           FPGA_ST0018 is not in savestate.c's core_has_snapshot list. */
+        props->has_st0018 = 1;
+        props->dsp_fw = DSPFW_ST0018;
+        props->fpga_conf = FPGA_ST0018;
       }
       /* OBC1 LoROM */
       else if (header->map == 0x30 && header->carttype == 0x25) {
@@ -475,10 +530,45 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
       }
   }
   
-  if (header->carttype == 0xcb) {
+  if(header->carttype == 0xcb) {
     // custom combo type.  supports all base mappers.  consider moving this to another field to support remaining mappers.
     props->has_combo = 1;
     props->fpga_features |= FEAT_COMBO;
+  }
+
+  /*
+   * Gamars Puzzle / Gamars Super DISK.
+   *
+   * The ROM itself is a normal 1 MiB LoROM image, but the original
+   * Gamars hardware provides a non-standard writable memory window.
+   *
+   * Software explicitly uses $31:6000-$31:61ff and also accesses the
+   * same storage through $41:6000-$41:61ff.
+   *
+   * Use mapper 4 in the BASE core.  Mapper 4 is otherwise unused by
+   * sd2snes_base (S-DD1 uses mapper_id 4 with its own FPGA core).
+   *
+   * Match the actual internal header rather than the bogus SRAM-size
+   * byte alone.  The original header contains:
+   *
+   *   name       "(C)GAMARS PUZZLE"
+   *   map        $20
+   *   carttype   $00
+   *   romsize    $0a (1 MiB)
+   *   ramsize    $20 (non-standard / invalid as Nintendo SRAM size)
+   *   checksum   $9e4d
+   *   complement $61b2
+   */
+  if(!props->fpga_conf
+     && SMC_FSIZE() == 0x100000
+     && !memcmp(header->name, "(C)GAMARS PUZZLE", 16)
+     && header->map == 0x20
+     && header->carttype == 0x00
+     && header->romsize == 0x0a
+     && header->ramsize == 0x20
+     && header->chk == 0x9e4d
+     && header->cchk == 0x61b2) {
+    props->mapper_id = 4;
   }
 
   /* $80-$9F boot remap for the listed LoROM slot carts (see smc_needs_bslorom).
@@ -508,6 +598,16 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
   if(props->ramsize_bytes < 2048) {
     props->ramsize_bytes = 0;
   }
+
+  /*
+   * Gamars Puzzle's header SRAM byte ($20) is not a Nintendo SRAM-size
+   * value.  The executable code demonstrably requires at least $200
+   * bytes at its special $31/$41:$6000 window.
+   */
+  if(props->mapper_id == 4 && !props->fpga_conf) {
+  props->ramsize_bytes = 0x200;
+  }
+
   props->region = (header->destcode <= 1 || header->destcode >= 13) ? 0 : 1;
 
   // adjust sram size for special cart types
@@ -528,7 +628,10 @@ void smc_id(snes_romprops_t* props, uint32_t file_offset) {
 
   /* ~12.5MHz for ST0010, 8MHz for DSPx */
   if(props->has_dspx) {
-    if(props->has_st0010) {
+    if(props->has_st0010 || props->has_st0011) {
+      /* uPD96050 family. Both want zero extra waitstates -- ST011's host
+         protocol is DMA-paced with no handshake and the core is already
+         slower than the real chip, so throttling it only loses bytes. */
       props->fpga_dspfeat = 0;
     } else {
       props->fpga_dspfeat = 4; /* 4 extra waitstates */

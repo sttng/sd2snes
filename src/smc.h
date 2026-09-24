@@ -34,7 +34,11 @@
 #define DSPFW_DSP1B ((const uint8_t*)"/sd2snes/dsp1b.bin")
 #define DSPFW_ST0010 ((const uint8_t*)"/sd2snes/st0010.bin")
 #define STBIOS_FW ((const uint8_t*)"/sd2snes/stbios.bin")
-#define DSPFW_ST0011 ((const uint8_t*)"/sd2snes/st0011.bin")
+#define DSPFW_ST0011 ((const uint8_t*)"/sd2snes/st011.rom")
+/* ST018: 160 KB = 128 KB ARM program ROM followed by 32 KB data ROM (the
+   same layout the common emulators use for st018.rom). */
+#define DSPFW_ST0018 ((const uint8_t*)"/sd2snes/st018.rom")
+#define ST0018_FW_SIZE (0x28000)
 // extern const uint8_t *DSPFW_PTRTEST=((uint8_t*)"/sd2snes/hurz");
 
 typedef struct __attribute__ ((__packed__)) {
@@ -86,6 +90,7 @@ typedef struct __attribute__ ((__packed__)) {
   uint8_t has_msu1;           /* MSU1 presence flag */
   uint8_t has_cx4;            /* CX4 presence flag */
   uint8_t has_obc1;           /* OBC1 presence flag */
+  uint8_t has_col20;          /* col20 presence flag */
   uint8_t has_gsu;            /* GSU presence flag */
   uint8_t has_fx3;            /* cart wants the Super FX 3 behavior of the GSU core */
   uint8_t has_sa1;            /* SA-1 presence flag */
@@ -107,6 +112,8 @@ typedef struct __attribute__ ((__packed__)) {
   uint8_t* error_param;       /* \0 separated list of parameters for error text */
   snes_header_t header;       /* original header from ROM image */
 } snes_romprops_t;
+
+void smc_set_file_span(uint32_t rom_size);
 
 void smc_id(snes_romprops_t*, uint32_t file_offset);
 void smc_id_sdram(snes_romprops_t* props, uint32_t sram_base, uint32_t rom_size);
