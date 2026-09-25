@@ -12,6 +12,10 @@ Usage:
     python3 fontedit.py addaccents         Insert PT-BR accented chars
     python3 fontedit.py addfrench          Insert French chars (è ù î ï ë û)
     python3 fontedit.py additalian         Insert Italian chars (ì ò È Ì Ò Ù)
+    python3 fontedit.py addgerman          Insert German chars (ä ö ß Ä Ö)
+    python3 fontedit.py fixcircumflex      Redraw the 8 circumflex tiles
+    python3 fontedit.py addrussian         Insert Cyrillic (codes 177-223)
+    python3 fontedit.py clearkatakana      Blank the leftover katakana (161-176)
     python3 fontedit.py addscrollbar       Write scrollbar glyphs (codes 16,17)
     python3 fontedit.py addprogressbar    Write progress-bar glyphs (codes 18,19)
     python3 fontedit.py export [opts]      Dump the font to an editable PNG
@@ -28,12 +32,23 @@ codepoint -> char mapping so const.a65 can reference them.
 
 `addfrench` adds the DIAERESIS mark (ë ï) alongside the existing GRAVE/CIRC
 marks and writes ONLY the 6 new slots (224-229), preserving every other tile
-(so the hand-made Spanish glyphs and the art in 161-223 are untouched). At 8x8
-the diaeresis and circumflex collapse to the same two-dot mark, so ë==ê and
-ï==î byte-for-byte (see DIAERESIS below).
+(so the hand-made Spanish glyphs and the art in 161-223 are untouched).
 
 `additalian` follows the same targeted pattern for codes 230-235 and introduces
 no new mark: every Italian glyph is the existing GRAVE over its base letter.
+
+`addrussian` writes the 47 Cyrillic letters that need a tile of their own: 46
+over the dead katakana block (178-223) and У at 177. The table holds the
+literal art, hand-tuned after the native-speaker review, so on an up-to-date
+font.a65 it is a no-op (tests/test_i18n_parity.py checks it). The other 19
+letters are HOMOGLYPHS -- an existing tile already draws them -- and that
+table is encode-only, never merged into ACCENT_MAP.
+
+`addgerman` does the same for 236-240. It needs the diaeresis to be a mark of
+its own, which is why CIRC was redrawn as 3 contiguous pixels: while the
+circumflex was itself two dots, a+diaeresis was byte-identical to â, so ä could
+not exist. `fixcircumflex` redraws the 8 tiles that carry the old mark; run it
+before addgerman on a font that predates the change.
 
 PNG SHEET
 ---------
@@ -71,15 +86,15 @@ in the outer corners and along the bottom row, which stays empty so stacked
 menu rows do not touch. Copying an existing letter and reshaping its strokes
 keeps a new script consistent far more easily than drawing one from scratch.
 
-`import` defaults to --only 162-175,178-223,236-255 -- the free tail of the
-table plus the dead katakana block (see RECYCLABLE_CODES: it is JIS X 0201
-left over from the CP932 era, unreachable since 2010). A full-sheet write is
-not the default because it would silently repaint the hand-made Spanish glyphs
-and the window art whenever an editor shifted a colour. Widen it deliberately
-(--only 130-159, --all) once the diff printed by --dry-run looks right.
+`import` defaults to --only 160-176,241-255 -- every slot still free: the tail
+of the table plus what Cyrillic left of the dead katakana block (see
+RECYCLABLE_CODES: it is JIS X 0201 left over from the CP932 era, unreachable
+since 2010). A full-sheet write is not the default because it would silently
+repaint the hand-made Spanish glyphs and the window art whenever an editor
+shifted a colour. Widen it deliberately (--only 130-159, --all) once the diff
+printed by --dry-run looks right.
 
-That leaves 80 slots for a new script, comfortably more than a full Cyrillic
-alphabet in both cases; `freeslots` prints the current tally.
+32 slots are left; `freeslots` prints the current tally.
 """
 
 import re
@@ -97,15 +112,48 @@ ACCENT_MAP = {
     "Í": 148, "Ó": 149, "Ô": 150, "Õ": 151, "Ú": 152, "Ç": 153,
     # Spanish additions:
     "ñ": 154, "Ñ": 155, "ü": 156, "Ü": 157, "¿": 158, "¡": 159,
-    # French additions (codes 160-165 are NOT free -- 161-223 hold other art,
-    # gameinfo reuses 160/161/176/177 for the chip icon OBJ. 224-255 are blank
-    # and unreferenced, so the French block lives there):
+    # French additions. When they went in, 160-223 was not free (katakana art in
+    # 161-223, and a game info chip icon since removed was drawn over the VRAM
+    # of 160/161/176/177), so the block went to the blank tail at 224-255:
     "è": 224, "ù": 225, "î": 226, "ï": 227, "ë": 228, "û": 229,
     # Italian additions. The lowercase graves the earlier blocks never needed
     # (à/è/ù already exist), plus the uppercase graves: Italian headers are drawn
     # in caps by the in-game menu and "E'" is not an acceptable stand-in for "È",
     # which opens a large share of sentences:
     "ì": 230, "ò": 231, "È": 232, "Ì": 233, "Ò": 234, "Ù": 235,
+    # German additions. ä/ö/Ä/Ö are the diaeresis applied to the same bases as
+    # the hand-made ü/Ü; ß has no base letter and is drawn by hand (SHARP_S).
+    "ä": 236, "ö": 237, "ß": 238, "Ä": 239, "Ö": 240,
+    # Cyrillic, drawn over the dead katakana block (see CYRILLIC below). Only
+    # the 47 letters that need a tile of their own live here; the 19 that reuse
+    # an existing tile are in HOMOGLYPHS, which must stay OUT of this table so
+    # the code -> char direction keeps one owner per code. Uppercase first,
+    # then lowercase, each in alphabet order, with У last:
+    "Б": 178, "Г": 179, "Д": 180, "Ё": 181, "Ж": 182, "З": 183,
+    "И": 184, "Й": 185, "Л": 186, "П": 187, "Ф": 188, "Ц": 189,
+    "Ч": 190, "Ш": 191, "Щ": 192, "Ъ": 193, "Ы": 194, "Ь": 195,
+    "Э": 196, "Ю": 197, "Я": 198, "б": 199, "в": 200, "г": 201,
+    "д": 202, "ж": 203, "з": 204, "и": 205, "й": 206, "к": 207,
+    "л": 208, "м": 209, "н": 210, "п": 211, "т": 212, "ф": 213,
+    "ц": 214, "ч": 215, "ш": 216, "щ": 217, "ъ": 218, "ы": 219,
+    "ь": 220, "э": 221, "ю": 222, "я": 223,
+    # У sits just below the block. It shared the Latin Y tile until that one was
+    # redrawn with a straight stem; У keeps the old tailed shape, byte for byte:
+    "У": 177,
+}
+
+# Cyrillic letters that an existing tile already draws: 11 uppercase and 7
+# lowercase Latin homoglyphs, plus ё, which is exactly the French ë (228).
+# ENCODE-ONLY. Folding them into ACCENT_MAP/ACCENTS would give a code two
+# owners, and the decode direction picks one -- a Latin 'A' would come back as
+# 'А' and a French ë as 'ё'.
+HOMOGLYPHS = {
+    "А": ord("A"), "В": ord("B"), "Е": ord("E"), "К": ord("K"), "М": ord("M"),
+    "Н": ord("H"), "О": ord("O"), "Р": ord("P"), "С": ord("C"), "Т": ord("T"),
+    "Х": ord("X"),
+    "а": ord("a"), "е": ord("e"), "о": ord("o"), "р": ord("p"), "с": ord("c"),
+    "у": ord("y"), "х": ord("x"),
+    "ё": 228,
 }
 
 BYTE_RE = re.compile(r"\$([0-9a-fA-F]{2})")
@@ -189,16 +237,28 @@ def show(code):
 
 ACUTE = "....###."
 GRAVE = ".###...."
-CIRC = "..#..#.."
+# Circumflex: two contiguous pixels, centred. It USED to be the two dots
+# "..#..#..", which is a diaeresis, not a circumflex -- so â/ê/ô read as ä/ë/ö
+# and every circumflex tile came out byte-identical to its diaeresis twin
+# (ê==ë, î==ï, û==ü). German needs ä/ö as distinct letters, so the circumflex
+# gives up the two-dot shape and keeps the row to itself. Each mark is now told
+# apart by extent and position on the single available row: acute leans right,
+# grave leans left, circumflex is 2px centred, tilde is 5px, diaeresis is the
+# only one that breaks into two dots. The circumflex has to stay at 2px: the
+# top row of A and O is already half-tone in cols 1 and 5, so a 3px or 4px mark
+# paints the same tile the 5px tilde does and Â==Ã, Ô==Õ.
+CIRC = "...##..."
 TILDE = ".#####.."
 CEDILLA_TOP = "...##..."
 CEDILLA_BOTTOM = "..####.."
-# Diaeresis / trema (ë ï, and the hand-made ü=156): two dots on the top row.
-# At 8x8 the accent shares the letter's top row, so the diaeresis reduces to the
-# same two-dot mark as the circumflex (cols 2 and 5) -- this matches the existing
-# ü precedent (overlay "..#..#.." on 'u' reproduces tile 156 exactly). Consequence:
-# ë is byte-identical to ê, and ï to î; there is no room to distinguish them.
+# Diaeresis / trema (ä ö ë ï ü): two dots on the top row, cols 2 and 5. This is
+# the shape the hand-made ü (156) has always used -- overlaying it on 'u'
+# reproduces that tile exactly -- so the Spanish glyphs stay the reference and
+# every other diaeresis is generated from them.
 DIAERESIS = "..#..#.."
+# Breve (Й й): a 3px arc, the only mark that is neither 2px (circumflex) nor
+# 5px (tilde) nor lopsided (acute/grave), so it stays legible next to them.
+BREVE = "..###..."
 
 
 def overlay_row(pixels, art_row, row, color=3):
@@ -252,7 +312,11 @@ def add_accents():
         "Ú": ("U", ACUTE),
     }
     new_tiles = dict(enumerate(tiles))  # code -> tile
-    for accented, code in ACCENT_MAP.items():
+    # ONLY the PT-BR block: every later language (es, fr, it, de, ru) has its own
+    # targeted writer, and its glyphs have no entry in `base`. Walking ACCENT_MAP
+    # here instead used to raise KeyError on the first Spanish letter.
+    for accented in list(base) + ["ç", "Ç"]:
+        code = ACCENT_MAP[accented]
         if accented == "ç":
             new_tiles[code] = pixels_to_tile(with_cedilla("c", tiles))
         elif accented == "Ç":
@@ -273,8 +337,8 @@ def add_accents():
     FONT.write_text("\n".join(out_lines) + "\n")
     print(f"Updated {FONT}")
     print("Accent codepoints:")
-    for accented, code in ACCENT_MAP.items():
-        print(f"  {accented} = {code}")
+    for accented in list(base) + ["ç", "Ç"]:
+        print(f"  {accented} = {ACCENT_MAP[accented]}")
 
 
 # -- French accents (targeted: writes ONLY the 6 new slots) -----------------
@@ -340,6 +404,216 @@ def add_italian():
     for ch, (base_letter, mark) in ITALIAN_BASE.items():
         code = ACCENT_MAP[ch]
         print(f"  {ch} = {code} (base {base_letter!r})")
+        print(render_ascii(tile_to_pixels(new_tiles[code])))
+
+
+# -- Cyrillic (targeted: writes ONLY codes 177-223) --------------------------
+# The Russian menu's second wall (see MENU-RUSSO-PLANO.md): the font is an
+# 8-bit codepage and Cyrillic is a whole alphabet, not a composed accent. It
+# fits because 19 letters are drawn by tiles that already exist -- 11 uppercase
+# and 7 lowercase Latin homoglyphs, plus ё which IS ë (228) -- leaving 47 to
+# draw: 46 over the dead katakana block (178-223) and У right below it (177).
+#
+# Each glyph is its LITERAL tile art in the ART_COLORS legend (. transparent,
+# x body, X outline, # half tone), so `addrussian` writes font.a65 back byte for
+# byte and tests/test_i18n_parity.py fails when the two drift. The first pass
+# was drafted as strokes through `stroke_to_pixels`; the native-speaker review
+# then redrew outlines and half tones by hand, which no stroke rule reproduces.
+# A glyph fixed in font.a65 has to come back into this table. У is the tailed
+# shape the Latin Y had before it got a straight stem.
+#
+# Grid, same as the Latin letters: uppercase and ascenders r0..r5, x-height
+# r1..r5, descenders down to r6, r7 always empty so stacked menu rows do not
+# touch. Ё/Й/й carry their mark on r0 like an accent.
+CYRILLIC = {
+    "Б": ["xxxxxxxX", "xxXXXXXX", "xxxxxx#X", "xxXXXxxX", "xxXXXxxX", "xxxxxx#X", "XXXXXXX.", "........"],
+    "Г": ["xxxxxx#X", "xxXXXXX.", "xxX.....", "xxX.....", "xxX.....", "xxX.....", "XXX.....", "........"],
+    "Д": [".XxxxxX.", ".XxXxxX.", "XXxXxxX.", "XxXXxxX.", "xxxxxxxX", "xXXXXXxX", "X.....X.", "........"],
+    "Ё": ["XxXXxXXX", "xxxxxxxX", "xxXXXXX.", "xxxxxX..", "xxXXXXX.", "xxxxxxxX", "XXXXXXX.", "........"],
+    "Ж": ["xxXxXxxX", "xxXxXxxX", "X#xxx#X.", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "XX.X.XXX", "........"],
+    "З": ["Xxxxx#X.", "xXXXXxxX", "XXxxx#X.", "X.XXXxxX", "xXXXXxxX", "Xxxxx#X.", ".XXXXX..", "........"],
+    "И": ["xxX.XxxX", "xxX.XxxX", "xxX.XxxX", "xxX.XxxX", "xxXXXxxX", "X#xx#xxX", ".XXXXXX.", "........"],
+    "Й": ["xxXxXxxX", "xxXXXxxX", "xxX.XxxX", "xxX.XxxX", "xxXXXxxX", "X#xx#xxX", ".XXXXXX.", "........"],
+    "Л": ["..XxxxxX", ".XxxXxxX", "XxxXXxxX", "xxX.XxxX", "xxX.XxxX", "xxX.XxxX", "XX...XX.", "........"],
+    "П": ["xxxxx#XX", "xxXXXxxX", "xxX.XxxX", "xxX.XxxX", "xxX.XxxX", "xxX.XxxX", "XX...XX.", "........"],
+    "У": ["xxX.XxxX", "xxX.XxxX", "xxXXXxxX", "X#xxxxxX", "XXXXXxxX", "xxxxx#X.", "XXXXXX..", "........"],
+    "Ф": ["X#xxx#X.", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "X#xxx#X.", ".XXxXX..", "...X...."],
+    "Ц": ["xxX.XxxX", "xxX.XxxX", "xxX.XxxX", "xxX.XxxX", "xxXXXxxX", "X#xx#xx#", ".XXXXXXx", "........"],
+    "Ч": ["xxX.XxxX", "xxX.XxxX", "xxXXXxxX", "X#xxxxxX", ".XXXXxxX", "....XxxX", ".....XX.", "........"],
+    "Ш": ["xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "X#xxxxxX", ".XXXXXX.", "........"],
+    "Щ": ["xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "X#xxxxx#", "XXXXXXXx", "........"],
+    "Ъ": ["xxxX....", "XxxXXXX.", "Xxxxxx#X", "XxxXXXxX", "XxxXXXxX", "Xxxxxx#X", ".XXXXXX.", "........"],
+    "Ы": ["xxX.XxxX", "xxXXXxxX", "xxxx#xxX", "xxXXx#xX", "xxXXx#xX", "xxxx#xxX", "XXXXXXX.", "........"],
+    "Ь": ["XxxX....", "XxxXXXX.", "Xxxxxx#X", "XxxXXXxX", "XxxXXXxX", "Xxxxxx#X", "XXXXXXX.", "........"],
+    "Э": ["xxxxxx#X", "XXXXXxxX", ".XxxxxxX", ".XXXXxxX", "XXXXXxxX", "xxxxxx#X", "XXXXXXX.", "........"],
+    "Ю": ["xxXxxxX.", "xxxXXXxX", "xxxX.XxX", "xxxX.XxX", "xxxXXXxX", "xxXxxxXX", "XX.XXXX.", "........"],
+    "Я": ["X#xxxxxX", "xxXXXxxX", "xxXXXxxX", "X#xxxxxX", "xxXXXxxX", "xxX.XxxX", "XXX..XXX", "........"],
+    "б": ["XXXXXXX.", "xxxxxxxX", "xxXXXXX.", "xxxxxx#X", "xxXXXxxX", "xxxxxx#X", "XXXXXXX.", "........"],
+    "в": ["XXXXXX..", "xxxxx#X.", "xxXXXxxX", "xxxxx#X.", "xxXXXxxX", "xxxxx#X.", "XXXXXX..", "........"],
+    "г": ["XXXXXXX.", "xxxxxx#X", "xxXXXXX.", "xxX.....", "xxX.....", "xxX.....", "XXX.....", "........"],
+    "д": ["..XXXX..", ".XxxxxX.", ".XxXxxX.", "XxXXxxX.", "xxxxxxxX", "xXXXXXxX", "X.....X.", "........"],
+    "ж": ["XX.X.XX.", "xxXxXxxX", "xxXxXxxX", "X#xxx#X.", "xxXxXxxX", "xxXxXxxX", "XX.X.XX.", "........"],
+    "з": [".XXXXX..", "Xxxxx#X.", "xXXXXxxX", "XXXxxxX.", "xXXXXxxX", "Xxxxx#X.", ".XXXXX..", "........"],
+    "и": ["XX...XX.", "xxX.XxxX", "xxX.XxxX", "xxX.XxxX", "xxXXXxxX", "X#xx#xxX", ".XXXXXX.", "........"],
+    "й": ["XXXxXXX.", "xxXXXxxX", "xxX.XxxX", "xxX.XxxX", "xxXXXxxX", "X#xx#xxX", ".XXXXXX.", "........"],
+    "к": ["XX...XX.", "xxX.XxxX", "xxXXXxxX", "xxxxx#X.", "xxXXXxxX", "xxX.XxxX", "XX...XXX", "........"],
+    "л": ["...XXXX.", "..XxxxxX", ".XxxXxxX", "XxxXXxxX", "xxX.XxxX", "xxX.XxxX", "XX...XX.", "........"],
+    "м": ["XXX.XX..", "xxxXx#XX", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "xxXXXxxX", "XX...XX.", "........"],
+    "н": ["XX...XX.", "xxX.XxxX", "xxXXXxxX", "xxxxxxxX", "xxXXXxxX", "xxX.XxxX", "XX...XX.", "........"],
+    "п": ["XXXXXXX.", "xxxxx#XX", "xxXXXxxX", "xxX.XxxX", "xxX.XxxX", "xxX.XxxX", "XX...XX.", "........"],
+    "т": ["XXXXXXX.", "xxxxxxxX", "XXXxxXX.", "..XxxX..", "..XxxX..", "..XxxX..", "...XX...", "........"],
+    "ф": [".XXXXX..", "X#xxx#X.", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "X#xxx#X.", ".XXxXX..", "...X...."],
+    "ц": ["XX...XX.", "xxX.XxxX", "xxX.XxxX", "xxX.XxxX", "xxXXXxxX", "X#xx#xx#", ".XXXXXXx", "........"],
+    "ч": ["XX...XX.", "xxX.XxxX", "xxX.XxxX", "xxXXXxxX", "X#xxxxxX", ".XXXXxxX", ".....XX.", "........"],
+    "ш": ["XX.X.XX.", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "X#xxxxxX", ".XXXXXX.", "........"],
+    "щ": ["XX.X.XX.", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "xxXxXxxX", "X#xxxxx#", "XXXXXXXx", "........"],
+    "ъ": ["XXX.....", "xxxXXXX.", "Xxxxxx#X", "XxxXXXxX", "XxxXXXxX", "Xxxxxx#X", ".XXXXXX.", "........"],
+    "ы": ["XX...XX.", "xxXXXxxX", "xxxx#xxX", "xxXXx#xX", "xxXXx#xX", "xxxx#xxX", "XXXXXXX.", "........"],
+    "ь": [".XX.....", "XxxXXXX.", "Xxxxxx#X", "XxxXXXxX", "XxxXXXxX", "Xxxxxx#X", ".XXXXXX.", "........"],
+    "э": [".XXXXXX.", "xxxxxx#X", ".XXXXxxX", ".XxxxxxX", ".XXXXxxX", "xxxxxx#X", ".XXXXXX.", "........"],
+    "ю": ["XX.XXX..", "xxXxxxX.", "xxxXXXxX", "xxxX.XxX", "xxxXXXxX", "xxXxxxX.", "XX.XXX..", "........"],
+    "я": ["XXXXXXX.", "X#xxxxxX", "xxXXXxxX", "xxXXXxxX", "X#xxxxxX", "xxXXXxxX", "XXX..XXX", "........"],
+}
+
+
+def stroke_to_pixels(art, mark=None):
+    """Glyph STROKE (colour 1) -> full 8x8 tile, wrapped in the font's outline.
+
+    Calibrated against the Latin alphabet: a pixel touching the stroke becomes
+    outline (2), except when every neighbour is diagonal -- the font leaves
+    those transparent -- and it becomes the half tone (3) where the stroke
+    crowds it (3+ neighbours, 3+ of them orthogonal), which is where the hand
+    drawn letters drop their anti-aliasing. Replaying it over the 94 printable
+    Latin tiles reproduces 94.7% of their pixels and 24 of them exactly, so a
+    glyph built this way sits next to them without looking foreign.
+
+    No command calls it any more: it drafted the first Cyrillic pass, which was
+    then tuned by hand and stored as literal art (see CYRILLIC). Draft a new
+    alphabet the same way.
+    """
+    st = [[1 if ch == "#" else 0 for ch in row] for row in art]
+    out = [row[:] for row in st]
+    for y in range(8):
+        for x in range(8):
+            if st[y][x]:
+                continue
+            nb = [(dy, dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+                  if (dy or dx) and 0 <= y + dy < 8 and 0 <= x + dx < 8 and st[y + dy][x + dx]]
+            if not nb:
+                continue
+            orth = sum(1 for dy, dx in nb if not (dy and dx))
+            if not orth:
+                continue
+            out[y][x] = 3 if (len(nb) >= 3 and orth >= 3) else 2
+    if mark:
+        overlay_row(out, mark, row=0)
+    return out
+
+
+def russian_tiles():
+    """code -> tile for every Cyrillic letter with a tile of its own."""
+    return {ACCENT_MAP[ch]: pixels_to_tile(art_to_pixels(art)) for ch, art in CYRILLIC.items()}
+
+
+def add_russian():
+    header, tiles = load_font()
+    new_tiles = dict(enumerate(tiles))  # code -> tile (start from current file)
+    new_tiles.update(russian_tiles())
+
+    out_lines = list(header)
+    total = max(len(tiles), max(new_tiles) + 1)
+    for code in range(total):
+        tile = new_tiles.get(code, [0] * 16)
+        label = "font" if code == 0 else None
+        out_lines.extend(encode_tile_lines(tile, label=label))
+    FONT.write_text("\n".join(out_lines) + "\n")
+    print(f"Updated {FONT}")
+    print(f"  {len(CYRILLIC)} Cyrillic glyphs written "
+          f"({min(ACCENT_MAP[c] for c in CYRILLIC)}-{max(ACCENT_MAP[c] for c in CYRILLIC)})")
+    for ch, code in sorted(HOMOGLYPHS.items(), key=lambda kv: kv[1]):
+        print(f"  {ch} = {code} (homoglyph, no tile of its own)")
+
+
+# -- Circumflex repair (targeted: rewrites ONLY the circumflex slots) --------
+# CIRC changed shape (see the note above), so every tile that carries one has to
+# be redrawn from its base letter. Touches ONLY these 8 codes; the diaeresis,
+# grave, acute, tilde and cedilla glyphs -- including the hand-made Spanish ones
+# -- are preserved byte-for-byte.
+CIRCUMFLEX_BASE = {
+    "â": "a", "ê": "e", "î": "i", "ô": "o", "û": "u",
+    "Â": "A", "Ê": "E", "Ô": "O",
+}
+
+
+def fix_circumflex():
+    header, tiles = load_font()
+    new_tiles = dict(enumerate(tiles))  # code -> tile (start from current file)
+    for ch, base_letter in CIRCUMFLEX_BASE.items():
+        code = ACCENT_MAP[ch]
+        new_tiles[code] = pixels_to_tile(with_accent(base_letter, CIRC, tiles))
+
+    out_lines = list(header)
+    total = max(len(tiles), max(new_tiles) + 1)
+    for code in range(total):
+        tile = new_tiles.get(code, [0] * 16)
+        label = "font" if code == 0 else None
+        out_lines.extend(encode_tile_lines(tile, label=label))
+    FONT.write_text("\n".join(out_lines) + "\n")
+    print(f"Updated {FONT}")
+    for ch, base_letter in CIRCUMFLEX_BASE.items():
+        code = ACCENT_MAP[ch]
+        print(f"  {ch} = {code} (base {base_letter!r})")
+        print(render_ascii(tile_to_pixels(new_tiles[code])))
+
+
+# -- German accents (targeted: writes ONLY the 5 new slots) ------------------
+# Same discipline as add_french/add_italian: touches ONLY codes 236-240. The
+# umlauts are the DIAERESIS on their base letter, the same construction as the
+# hand-made ü (156). ß has no base letter, so it is the one glyph in the font
+# drawn pixel by pixel: an ascender-height stem with a rounded top and an open
+# lower bowl, which is what tells it apart from B. Colours follow the font's
+# convention -- 1 = white body, 2 = dark outline, 3 = half-tone corner.
+GERMAN_BASE = {
+    "ä": ("a", DIAERESIS), "ö": ("o", DIAERESIS),
+    "Ä": ("A", DIAERESIS), "Ö": ("O", DIAERESIS),
+}
+SHARP_S = [
+    "Xxxxx#X.",
+    "xxXXxxX.",
+    "xxxxx#X.",
+    "xxXXxxXX",
+    "xxXXXxxX",
+    "xxXxxx#X",
+    "XXXXXXX.",
+    "........",
+]
+ART_COLORS = {".": 0, "x": 1, "X": 2, "#": 3}
+
+
+def art_to_pixels(art):
+    """Literal 8x8 glyph art -> colour indices (inverse of render_ascii)."""
+    return [[ART_COLORS[ch] for ch in row] for row in art]
+
+
+def add_german():
+    header, tiles = load_font()
+    new_tiles = dict(enumerate(tiles))  # code -> tile (start from current file)
+    for ch, (base_letter, mark) in GERMAN_BASE.items():
+        code = ACCENT_MAP[ch]
+        new_tiles[code] = pixels_to_tile(with_accent(base_letter, mark, tiles))
+    new_tiles[ACCENT_MAP["ß"]] = pixels_to_tile(art_to_pixels(SHARP_S))
+
+    out_lines = list(header)
+    total = max(len(tiles), max(new_tiles) + 1)
+    for code in range(total):
+        tile = new_tiles.get(code, [0] * 16)
+        label = "font" if code == 0 else None
+        out_lines.extend(encode_tile_lines(tile, label=label))
+    FONT.write_text("\n".join(out_lines) + "\n")
+    print(f"Updated {FONT}")
+    for ch in list(GERMAN_BASE) + ["ß"]:
+        code = ACCENT_MAP[ch]
+        print(f"  {ch} = {code}")
         print(render_ascii(tile_to_pixels(new_tiles[code])))
 
 
@@ -424,6 +698,35 @@ def add_scrollbar():
         print(render_ascii(tile_to_pixels(new_tiles[code])))
 
 
+# -- Katakana cleanup -------------------------------------------------------
+# Blank what is left of the dead JIS X 0201 block. Cyrillic took 178-223 and
+# later 177 (У); this clears 161-176 so the table stops showing glyphs nothing can
+# emit. It frees no space -- the font is always 256 tiles -- but it does change
+# one thing for the better: a CP1252 file name whose bytes land here used to
+# draw a random katakana, and now draws nothing. The blanked tiles are ordinary
+# free slots (see RESERVED_CODES).
+KATAKANA_LEFTOVER = range(161, 177)
+
+
+def clear_katakana():
+    header, tiles = load_font()
+    new_tiles = dict(enumerate(tiles))  # code -> tile (start from current file)
+    cleared = [c for c in KATAKANA_LEFTOVER if c < len(tiles) and any(tiles[c])]
+    for code in cleared:
+        new_tiles[code] = [0] * 16
+
+    out_lines = list(header)
+    total = max(len(tiles), max(new_tiles) + 1)
+    for code in range(total):
+        tile = new_tiles.get(code, [0] * 16)
+        label = "font" if code == 0 else None
+        out_lines.extend(encode_tile_lines(tile, label=label))
+    FONT.write_text("\n".join(out_lines) + "\n")
+    print(f"Updated {FONT}")
+    print(f"  blanked {len(cleared)} leftover katakana tile(s): "
+          f"{', '.join(str(c) for c in cleared) or '(none)'}")
+
+
 # -- PNG sheet round trip ---------------------------------------------------
 # The font is 256 tiles laid out as a 16x16 grid, row-major, so cell (col,row)
 # holds code row*16+col. The sheet has no gutters and no scaling by default:
@@ -450,22 +753,20 @@ SHEET_PALETTE = [
 # 0/1 terminate a string, 2..22 ($02..$16) are the sysinfo placeholder bytes,
 # 16/17 are the scrollbar glyphs, and 32 is the space (blank by design).
 #
-# 160/161/176/177 are a different kind of taken: gameinfo does not draw those
-# glyphs, it claims the VRAM they occupy. The chip icon is a 16x16 OBJ DMA'd
-# straight over their tile slots (GI_CHIP_VRAM0 $4A00 = 160/161 top row,
-# GI_CHIP_VRAM1 $4B00 = 176/177 bottom row, gameinfo.a65). A letter parked
-# there would survive in font.a65 and still be destroyed on screen the moment
-# a game info screen opened, so they stay out of the alphabet.
-RESERVED_CODES = set(range(0, 33)) | {160, 161, 176, 177}
+# 160/161/176/177 used to be reserved too: the game info screen DMA'd a 16x16
+# chip icon straight over their VRAM. That icon was dead code -- its gate tested
+# GAMEINFO_FLAG_IMAGE, the retired DirectColor .gd flag that nothing sets any
+# more -- so it was removed and the four slots are ordinary free slots now.
+RESERVED_CODES = set(range(0, 33))
 
-# Dead weight, free to overwrite: 161-223 is JIS X 0201 half-width katakana at
+# Dead weight, free to overwrite: 161-223 WAS JIS X 0201 half-width katakana at
 # its exact encoding positions ($A1-$DF), drawn in 2009 back when FatFs here
 # was set to CP932 so Japanese file names would render in the browser. ikari
 # moved _CODE_PAGE to 1252 in 2010 and it never went back, so nothing can emit
 # these any more: a Japanese LFN no longer converts and FatFs substitutes '?'
 # (ff.c), the internal ROM header title -- the other JIS X 0201 source -- is
 # never displayed (smc.c only pattern-matches it), and no menu string uses the
-# range. 176/177 stay out of it: gameinfo reuses them for the chip icon.
+# range.
 #
 # The range is not inert, it is actively wrong: under CP1252 an accented file
 # name lands right here with no translation to our own accent slots, so
@@ -476,13 +777,16 @@ RESERVED_CODES = set(range(0, 33)) | {160, 161, 176, 177}
 # small kana -- and nothing references them either (the near hits are the $aa
 # handshake NACK, an X coordinate of 172 in the sprite table, and the igmenu
 # $a5 magic; none is a tile index). Window borders are tiles 20-27, not these.
-RECYCLABLE_CODES = set(range(162, 176)) | set(range(178, 224))
+# Cyrillic took 178-223 and `clearkatakana` blanked the rest, so nothing is
+# left in the "dead glyph still sitting there" state -- an empty 162-175 now
+# reports as plain free. Kept as the record of where those slots came from.
+RECYCLABLE_CODES = set(range(162, 176))
 
-# What a sheet import may write unasked: the free tail plus the katakana
-# block. Everything else -- the hand-made Spanish glyphs, the window art --
-# needs an explicit --only/--all, so an editor shifting a colour cannot
-# quietly repaint them.
-DEFAULT_IMPORT_RANGE = "162-175,178-223,236-255"
+# What a sheet import may write unasked: every free slot, i.e. the tail plus
+# what is left of the katakana block. Everything else -- the hand-made Spanish
+# glyphs, the window art -- needs an explicit --only/--all, so an editor
+# shifting a colour cannot quietly repaint them.
+DEFAULT_IMPORT_RANGE = "160-176,241-255"
 
 DEFAULT_SHEET = "font_sheet.png"
 DEFAULT_GUIDE = "font_guide.png"
@@ -806,6 +1110,14 @@ def main():
         add_french()
     elif cmd == "additalian":
         add_italian()
+    elif cmd == "addgerman":
+        add_german()
+    elif cmd == "fixcircumflex":
+        fix_circumflex()
+    elif cmd == "addrussian":
+        add_russian()
+    elif cmd == "clearkatakana":
+        clear_katakana()
     elif cmd == "addscrollbar":
         add_scrollbar()
     elif cmd == "addprogressbar":

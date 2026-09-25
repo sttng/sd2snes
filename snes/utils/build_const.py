@@ -38,16 +38,50 @@ ACCENTS = {
     "Í": 148, "Ó": 149, "Ô": 150, "Õ": 151, "Ú": 152, "Ç": 153,
     # Spanish additions:
     "ñ": 154, "Ñ": 155, "ü": 156, "Ü": 157, "¿": 158, "¡": 159,
-    # French additions (codes 160-165 are NOT free -- 161-223 hold other art,
-    # gameinfo reuses 160/161/176/177 for the chip icon OBJ. 224-255 are blank
-    # and unreferenced, so the French block lives there):
+    # French additions. When they went in, 160-223 was not free (katakana art in
+    # 161-223, and a game info chip icon since removed was drawn over the VRAM
+    # of 160/161/176/177), so the block went to the blank tail at 224-255:
     "è": 224, "ù": 225, "î": 226, "ï": 227, "ë": 228, "û": 229,
     # Italian additions. The lowercase graves the earlier blocks never needed
     # (à/è/ù already exist), plus the uppercase graves: Italian headers are drawn
     # in caps by the in-game menu and "E'" is not an acceptable stand-in for "È",
     # which opens a large share of sentences:
     "ì": 230, "ò": 231, "È": 232, "Ì": 233, "Ò": 234, "Ù": 235,
+    # German additions. Without them ä/ö/ß fall through as literal UTF-8 and
+    # each one renders as two tiles of katakana art. ä/ö/Ä/Ö are the diaeresis
+    # over the same bases as ü/Ü; ß is hand-drawn (it has no base letter):
+    "ä": 236, "ö": 237, "ß": 238, "Ä": 239, "Ö": 240,
+    # Cyrillic, drawn over the dead katakana block (fontedit.py CYRILLIC). Only
+    # the 47 letters that need a tile of their own are here; the 19 that reuse
+    # an existing tile are in HOMOGLYPHS below. Uppercase then lowercase, each
+    # in alphabet order, with У last:
+    "Б": 178, "Г": 179, "Д": 180, "Ё": 181, "Ж": 182, "З": 183,
+    "И": 184, "Й": 185, "Л": 186, "П": 187, "Ф": 188, "Ц": 189,
+    "Ч": 190, "Ш": 191, "Щ": 192, "Ъ": 193, "Ы": 194, "Ь": 195,
+    "Э": 196, "Ю": 197, "Я": 198, "б": 199, "в": 200, "г": 201,
+    "д": 202, "ж": 203, "з": 204, "и": 205, "й": 206, "к": 207,
+    "л": 208, "м": 209, "н": 210, "п": 211, "т": 212, "ф": 213,
+    "ц": 214, "ч": 215, "ш": 216, "щ": 217, "ъ": 218, "ы": 219,
+    "ь": 220, "э": 221, "ю": 222, "я": 223,
+    # У sits just below the block. It shared the Latin Y tile until that one was
+    # redrawn with a straight stem; У keeps the old tailed shape, byte for byte:
+    "У": 177,
 }
+
+# Cyrillic letters an existing tile already draws: 11 uppercase and 7 lowercase
+# Latin homoglyphs, plus ё, which IS the French ë (228). ENCODE-ONLY -- putting
+# them in ACCENTS would give a code two owners and DECODE would pick the wrong
+# one, handing back 'А' for a Latin 'A' and 'ё' for a French ë.
+HOMOGLYPHS = {
+    "А": ord("A"), "В": ord("B"), "Е": ord("E"), "К": ord("K"), "М": ord("M"),
+    "Н": ord("H"), "О": ord("O"), "Р": ord("P"), "С": ord("C"), "Т": ord("T"),
+    "Х": ord("X"),
+    "а": ord("a"), "е": ord("e"), "о": ord("o"), "р": ord("p"), "с": ord("c"),
+    "у": ord("y"), "х": ord("x"),
+    "ё": 228,
+}
+# What encode_string may translate; DECODE stays keyed on ACCENTS alone.
+ENCODE = {**ACCENTS, **HOMOGLYPHS}
 DECODE = {v: k for k, v in ACCENTS.items()}
 
 # `LABEL  .byt  <args>` (args may contain quoted strings and raw byte values).
@@ -66,10 +100,10 @@ def encode_string(text):
             pieces.append(text[i + 1:end])
             i = end + 1
             continue
-        if ch in ACCENTS:
+        if ch in ENCODE:
             if cur:
                 pieces.append(f'"{cur}"'); cur = ""
-            pieces.append(str(ACCENTS[ch]))
+            pieces.append(str(ENCODE[ch]))
         else:
             cur += ch
         i += 1
@@ -243,7 +277,7 @@ def main():
                     ("text_no_", 22), ("cheat_tab_head", 48),
                     ("text_mtl_", 40), ("text_mt_", 32), ("text_pcm_", 40),
                     ("mtext_", 40),
-                    ("mdesc_", 160), ("text_err_", 26))
+                    ("mdesc_", 160), ("text_err_", 26), ("text_ce_", 6))
     WIDTH_DEFAULT = 56
 
     def encoded_len(text):
@@ -352,12 +386,18 @@ def main():
         for label, args in plaindefs:
             out.append(f"{label} .byt {args}")
 
-    # The interned pool + dispatch tables live in a SEPARATE bank ($C2) so the
-    # menu can grow past 128K. resolve_str reads every pooled string with
-    # bank ^strtab_lo, and menudata reaches each dispatch table via ^label, so the
-    # bank split is transparent to the menu. Output -> <out>_str.a65, linked at $C2.
+    # The interned pool and the dispatch tables live in SEPARATE banks so the menu
+    # can grow past 128K AND the scarce pool bank is not also paying for the tables:
+    # the pool -> <out>_str.a65 at $C2, the tables -> <out>_tab.a65 at $C1 (tens of KB
+    # free). menudata reaches each dispatch table via ^label, so the split is
+    # transparent there, but resolve_str (ui.a65) and ovl_fill_noname
+    # (sysinfo_render.a65) MUST use ^strtab_lo for the table and ^strpool_lo for the
+    # string it names -- getting one of the two wrong assembles clean and renders junk.
     strout = [".link page $c2", "",
-              "; ==== interned language string pool (deduplicated) ===="]
+              "; ==== interned language string pool (deduplicated) ====",
+              "; strpool_lo: the bank of THIS label is the bank of every pooled string",
+              "; (^strpool_lo in resolve_str / ovl_fill_noname).",
+              "strpool_lo"]
     for args in pool_order:
         strout.append(f"{pool[args]} .byt {args}")
 
@@ -375,24 +415,29 @@ def main():
         if any(differs(d.get(l), l) for l in order):
             nlang = idx + 1
 
-    strout += ["", f"; ==== dispatch tables: resolve_str range [strtab_lo, strtab_hi) ===="]
     lang_names = ", ".join(["EN"] + [code for code, _ in langs])
-    strout += [f"; each table = {nlang} x 16-bit address ({lang_names})[:{nlang}]; NO bank byte:",
-               "; every pooled string lives in the same bank as strtab_lo, so resolve_str",
-               "; uses ^strtab_lo as the bank for all of them. cur_lang >= strtab_nlang -> EN."]
-    strout.append(f"strtab_nlang .byt {nlang}")
-    strout.append("strtab_lo")
+    tabout = [".link page $c1", "",
+              f"; ==== dispatch tables: resolve_str range [strtab_lo, strtab_hi) ====",
+              f"; each table = {nlang} x 16-bit address ({lang_names})[:{nlang}]; NO bank byte:",
+              "; the pool is a DIFFERENT bank ($C2), so a reader takes the table with",
+              "; ^strtab_lo and the string it names with ^strpool_lo.",
+              "; cur_lang >= strtab_nlang -> EN."]
+    tabout.append(f"strtab_nlang .byt {nlang}")
+    tabout.append("strtab_lo")
     for label, labels in tabledefs:
         cols = labels[:nlang]
         # `label .word ...` (no colon) matches the proven `label .byt ...` style.
-        strout.append(f"{label} " + " : ".join(f".word !{c}" for c in cols))
-    strout.append("strtab_hi")
+        tabout.append(f"{label} " + " : ".join(f".word !{c}" for c in cols))
+    tabout.append("strtab_hi")
 
     out_path.write_text("\n".join(out) + "\n")
     str_path = out_path.with_name(out_path.stem + "_str" + out_path.suffix)
     str_path.write_text("\n".join(strout) + "\n")
-    print(f"generated {out_path} + {str_path}: {len(order)} localized labels "
-          f"({len(pool_order)} pooled strings in bank $C2), {nlang} language column(s)")
+    tab_path = out_path.with_name(out_path.stem + "_tab" + out_path.suffix)
+    tab_path.write_text("\n".join(tabout) + "\n")
+    print(f"generated {out_path} + {str_path} + {tab_path}: {len(order)} localized labels "
+          f"({len(pool_order)} pooled strings in bank $C2, "
+          f"{len(tabledefs)} dispatch tables in bank $C1), {nlang} language column(s)")
 
 
 if __name__ == "__main__":

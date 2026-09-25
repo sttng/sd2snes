@@ -18,6 +18,7 @@
 #include "patch.h"
 #include "patchmeta.h"
 #include "cheat.h"
+#include "cheatedit.h"
 #include "theme.h"
 #include "manual.h"
 #include "memtest.h"
@@ -25,6 +26,8 @@
 #include "pcmplay.h"
 #include "menucmd.h"
 #include "util.h"
+#include "timer.h"    /* getticks: seed for the random menu-music draw */
+#include "rtc.h"      /* get_bcdtime: mixed into that seed when the RTC is valid */
 
 extern volatile cfg_t CFG;
 extern volatile mcu_status_t STM;
@@ -237,6 +240,17 @@ static NO_INLINE void delete_file_from(sel_src_t s) {
   printf("Delete file: %s (src %d)\n", file_lfn, (int)s);
   if(f_unlink((TCHAR*)file_lfn) != FR_OK) {
     snescmd_writebyte(0xaa, SNESCMD_SNES_CMD);
+  } else {
+    /* The ROM is gone, so its presentation sidecars describe nothing: cover, info
+       screen, guides, clip and cheats go with it (patch_unlink_rom_assets shares the
+       export's inventory).  Battery saves, memory packs and savestates stay -- "delete
+       save" is its own action and lost progress does not come back.
+       Gated on the file being a ROM: the browser also deletes .spc/.thm/.pcm, and one
+       of those sharing a game's stem would otherwise wipe that game's assets. */
+    SNES_FTYPE t = filetype_by_ext((const char*)file_lfn);
+    if(t == TYPE_ROM || t == TYPE_NES) {
+      printf("Deleted %d asset(s) of %s\n", patch_unlink_rom_assets(file_lfn), file_lfn);
+    }
   }
   revalidate_game_lists();
 }
@@ -291,7 +305,7 @@ static void delete_srm_from(sel_src_t s) {
    sitting in (FILESEL_CWD, which the menu keeps at SRAM_MENU_FILEPATH_ADDR) with no item
    pre-selected. Never reuse SRAM_LASTGAME_DIR/FILE for this: those are rewritten on every
    menu boot by cfg_dump_listed_games_for_snes. */
-static NO_INLINE void browser_pos_save(const char *path) {
+NO_INLINE void browser_pos_save(const char *path) {
   char dir[256];
   const char *slash = path ? strrchr(path, '/') : NULL;
   if(slash) {
@@ -439,6 +453,19 @@ static NO_INLINE void query_ips_patches(void) {
   }
 }
 
+/* The info screen's Up/Down stepped onto a folder (snes/gameinfo.a65, gnav_msu_dir): answer
+   MCU_PARAM+7 = 'M' when it may open as its MSU-1 game.  MCU_PARAM is set like LOADROM, so
+   get_selected_name yields "<cwd>/<folder>/"; the menu zeroed +7, and every other outcome
+   leaves it at "no". */
+static NO_INLINE void msu_probe(void) {
+  uint8_t path[256];
+  get_selected_name(path);
+  size_t n = strlen((char*)path);
+  if(n > 1 && path[n-1] == '/') path[n-1] = 0;
+  if(CFG.open_msu_folders && dir_may_open_as_msu(path))
+    snescmd_writebyte('M', SNESCMD_MCU_PARAM + 7);
+}
+
 /* Commands issued FROM the pre-boot info screen, i.e. the ones that must NOT stop a running FMV.
    Everything else means the SNES left that screen (see the call site in the menu loop).
      - FMV_NEXT                        : the pump itself
@@ -447,7 +474,9 @@ static NO_INLINE void query_ips_patches(void) {
                                          Stopping here killed the video AND its audio for good
                                          (nothing ever re-opens the .fmv) -- that was the bug.
      - MANUAL_S1PAGE / MANUAL_ZPAGE    : the manual viewer opened from the info screen; the same
-                                         reasoning applies on the way back out of it. */
+                                         reasoning applies on the way back out of it.
+   MSU_PROBE / READDIR are NOT here although Up/Down on the screen sends them while stepping
+   across folders: they stop the clip, and the step reloads the panel whenever it sent one. */
 static int cmd_keeps_fmv(uint8_t cmd) {
   return cmd == SNES_CMD_FMV_NEXT
       || cmd == SNES_CMD_GAME_INFO
@@ -590,6 +619,119 @@ uint32_t menucmd_launch_rom(uint8_t cmd) {
   return 0;
 }
 
+/* Random menu music (CFG.menu_music_random + CFG.menu_music_folder).
+   There is no rand() in this firmware and pulling one in would drag stdlib's
+   reentrancy state along, which is flash the mk2 does not have; xorshift32 costs a
+   handful of instructions and is far beyond what "pick a file" needs.
+   Seeded lazily, once: the tick counter alone starts from about the same value on
+   every power-on, so the first draw of a session would keep landing on the same
+   track -- the wall clock is mixed in whenever the RTC has one (STM.rtc_valid == 0
+   means valid, 0xff means it is not; see main.c). */
+static uint32_t menu_spc_rnd_state = 0;
+
+static uint32_t menu_spc_rnd(void) {
+  uint32_t x = menu_spc_rnd_state;
+  if(!x) {
+    x = (uint32_t)getticks() * 2654435761u;
+    if(!STM.rtc_valid) {
+      uint64_t bcd = get_bcdtime();
+      x ^= (uint32_t)bcd ^ (uint32_t)(bcd >> 32);
+    }
+    if(!x) x = 0x1a2b3c4du;   /* zero is xorshift32's fixed point: it never leaves it */
+  }
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  menu_spc_rnd_state = x;
+  return x;
+}
+
+/* Fingerprint of the previous draw, so two BGM loads in a row (a boot and the return
+   from the first game, say) do not land on the same track.  A HASH and not the name:
+   it only has to answer "the same file as last time?", a collision costs at worst one
+   redundant re-draw, and the .bss on this MCU is the same pool the stack eats into --
+   4 bytes instead of a name buffer is the whole reason this is not a strncmp. */
+static uint32_t menu_spc_prev_hash;
+
+/* FNV-1a: a couple of instructions per byte and no table. */
+static uint32_t menu_spc_hash(const char *s) {
+  uint32_t h = 2166136261u;
+  while(*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+  return h;
+}
+
+/* Draw a random .spc from CFG.menu_music_folder and write its full SD path to `out`.
+   Returns 1 when it wrote one and 0 when there is nothing to draw from -- folder not
+   configured, missing, unreadable, or holding no .spc -- so the caller falls back to
+   its fixed choice and the feature can never leave the menu silent.
+
+   ONE f_opendir/f_readdir pass, with a reservoir of a single element: keeping the
+   n-th candidate with probability 1/n leaves every file equally likely without ever
+   building a list, so the folder may hold any number of tracks and this still costs
+   one name's worth of RAM.
+
+   `out` doubles as the FatFs long-name buffer for the scan.  That is what keeps this
+   down to a single path buffer, and it works precisely BECAUSE f_readdir overwrites
+   it on every entry: nothing may survive there across the loop, which is why the
+   winner is copied out to `pick` and the path is only assembled at the very end.
+   (Same trap patch_scan_dir documents, from the other side.)
+
+   noinline: menucmd_dispatch sits under EVERY menu command, so this frame would
+   otherwise be paid by all the commands that never touch music (see NO_INLINE). */
+static NO_INLINE int menu_spc_pick_random(uint8_t *out, int outsize) {
+  /* CFG is volatile only because it is the shared BSRAM mirror; reading the folder
+     name as a plain string is what every other CFG string consumer does. */
+  const char *folder = (const char*)CFG.menu_music_folder;
+  char pick[256];
+  DIR dir;
+  FILINFO fno;
+  size_t flen;
+  int attempt;
+
+  if(folder[0] != '/') return 0;                   /* not configured -> caller falls back */
+  flen = strlen(folder);
+  while(flen && folder[flen - 1] == '/') flen--;   /* the join below adds exactly one */
+  if(flen + 2 >= (size_t)outsize) return 0;        /* no room for even a 1-char name */
+
+  for(attempt = 0; attempt < 2; attempt++) {
+    unsigned n = 0;
+    pick[0] = 0;
+    fno.lfsize = (UINT)((outsize > 256) ? 255 : outsize - 1);
+    fno.lfname = (TCHAR*)out;
+    if(f_opendir(&dir, (const TCHAR*)folder) != FR_OK) return 0;
+    for(;;) {
+      const char *fn, *ext;
+      size_t len;
+      if(f_readdir(&dir, &fno) != FR_OK || fno.fname[0] == 0) break;
+      if(fno.fattrib & (AM_DIR | AM_HID | AM_SYS)) continue;
+      fn = fno.lfname[0] ? fno.lfname : fno.fname;
+      /* macOS leaves a "._<name>.spc" beside every file it copies; those pass the
+         extension test below and would be drawn as if they were tracks. */
+      if(fn[0] == '.') continue;
+      ext = strrchr(fn, '.');
+      if(!ext || strcasecmp(ext + 1, "SPC")) continue;
+      len = strlen(fn);
+      /* Never draw a name the join could not hold: a truncated path opens some OTHER
+         file, which is why patch_scan_dir refuses over-long names too. */
+      if(len >= sizeof(pick) || flen + 1 + len >= (size_t)outsize) continue;
+      if((menu_spc_rnd() % ++n) == 0) memcpy(pick, fn, len + 1);
+    }
+    f_closedir(&dir);
+    if(!n) return 0;                               /* no .spc in there */
+    /* Do not repeat the previous track -- but draw again AT MOST once.  Retrying
+       until it differs is an unbounded coin flip as soon as the folder holds only
+       two files, and this runs while the SNES waits on the command. */
+    if(n < 2 || menu_spc_hash(pick) != menu_spc_prev_hash) break;
+  }
+
+  menu_spc_prev_hash = menu_spc_hash(pick);
+  memcpy(out, folder, flen);
+  out[flen] = '/';
+  memcpy(out + flen + 1, pick, strlen(pick) + 1);
+  printf("Random menu music: %s\n", out);
+  return 1;
+}
+
 uint8_t menucmd_dispatch(uint8_t cmd, uint8_t *menu_reload) {
   switch(cmd) {
     case SNES_CMD_QUERY_IPS_PATCHES:
@@ -683,6 +825,9 @@ uint8_t menucmd_dispatch(uint8_t cmd, uint8_t *menu_reload) {
       *menu_reload = 1;
       return cmd;
     }
+    case SNES_CMD_MSU_PROBE:
+      msu_probe();
+      return 0;
     case SNES_CMD_PLAY_PCM:
       /* A .pcm was picked in the browser: play it on the cartridge DAC.  MCU_PARAM was
          set up like a ROM launch (cwd + selected entry), so get_selected_name yields the
@@ -703,14 +848,26 @@ uint8_t menucmd_dispatch(uint8_t cmd, uint8_t *menu_reload) {
         default:                 pcmplay_stop();   break;
       }
       return 0;
-    case SNES_CMD_LOAD_MENU_SPC:
+    case SNES_CMD_LOAD_MENU_SPC: {
       /* stage background menu music. Use the user-chosen .spc (CFG.bgm_name, a
          full SD path set via SNES_CMD_SET_MENU_SPC) when present, otherwise fall
          back to the fixed /sd2snes/menu.spc. load_spc is graceful: a missing/
          too-small file zeroes the SPC header, which the menu detects and skips. */
-      load_spc((uint8_t*)(CFG.bgm_name[0] == '/' ? CFG.bgm_name : (uint8_t*)"/sd2snes/menu.spc"),
-               SRAM_SPC_DATA_ADDR, SRAM_SPC_HEADER_ADDR);
+      uint8_t *spc = (uint8_t*)(CFG.bgm_name[0] == '/' ? CFG.bgm_name
+                                                       : (uint8_t*)"/sd2snes/menu.spc");
+      /* Shuffle mode wins over both: draw a fresh track out of CFG.menu_music_folder.
+         Nothing has to be scheduled for this -- the menu already issues this command
+         once per BGM load, i.e. on the menu boot and on every return from a game, so
+         "a new track each time you come back to the menu" falls out of the existing
+         handshake.  The draw writes into file_lfn (a menu-mode scratch buffer every
+         other handler here fills the same way) and returns 0 for a folder that is
+         missing/empty/unset, which leaves the two lines above untouched. */
+      if(CFG.menu_music_random && menu_spc_pick_random(file_lfn, sizeof(file_lfn))) {
+        spc = file_lfn;
+      }
+      load_spc(spc, SRAM_SPC_DATA_ADDR, SRAM_SPC_HEADER_ADDR);
       return 0;
+    }
     case SNES_CMD_ADD_FAVORITE_ROM:
       add_favorite_from(SEL_BROWSER);
       return 0;
@@ -831,6 +988,10 @@ uint8_t menucmd_dispatch(uint8_t cmd, uint8_t *menu_reload) {
       strncpy((char*)CFG.bgm_name, (char*)file_lfn, sizeof(CFG.bgm_name) - 1);
       CFG.bgm_name[sizeof(CFG.bgm_name) - 1] = 0;
       CFG.enable_menu_music = 1;
+      /* Picking a track by hand has to turn shuffle OFF: the random draw overrides
+         bgm_name on every BGM load, so leaving it on would silently ignore the choice
+         the user just made from the very next boot onwards. */
+      CFG.menu_music_random = 0;
       cfg_save();
       browser_pos_save((char*)file_lfn); /* come back to this .spc */
       *menu_reload = 1; /* leave loop -> outer loop reloads, boots into the new BGM */
@@ -878,6 +1039,15 @@ uint8_t menucmd_dispatch(uint8_t cmd, uint8_t *menu_reload) {
          Lets menu.bin be updated over USB without a physical power-cycle. */
       *menu_reload = 1;
       return cmd;
+    case SNES_CMD_CHEAT_EDIT:
+      /* Cheat editor (menu cheat list): serve the request in the CHEAT_EDIT block,
+         then rewrite the .yml the list was loaded from.  SIBLING calls on purpose:
+         the yml writer carries the deep frame (cheat_record_t + path), and nesting
+         it under the editor would add the two.  The record set is already updated
+         when the save fails, so only the result byte says so. */
+      if(cheat_edit_serve(0) && cheat_yaml_save_current())
+        sram_writebyte(CHEAT_EDIT_RES_SAVEFAIL, SRAM_CHEAT_EDIT_ADDR + CHEAT_EDIT_OFS_RESULT);
+      return 0;
     default:
       printf("unknown cmd: %d\n", cmd);
       break;

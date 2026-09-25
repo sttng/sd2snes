@@ -50,6 +50,8 @@
 #include "pcmplay.h"/* pcmplay_publish: menu PCM player status block */
 #include "gameinfo.h" /* gameinfo_fmv_idle_check : stop a lingering FMV when its screen closes */
 #include "cheat.h"
+#include "cheatedit.h"
+#include "trainer.h"
 #include "savestate.h"
 #include "manual.h"
 #include "sufami.h"
@@ -121,6 +123,10 @@ const SramOffset SramOffsetTable[] = {
 };
 
 void prepare_reset() {
+  /* The game is about to restart with freshly initialised WRAM, so a live search
+     would be comparing against values that no longer mean anything. (A bare RESET
+     button press does not come through here -- that case is documented.) */
+  trainer_invalidate(TRAINER_NOTICE_RESET);
   snes_reset(1);
   delay_ms(SNES_RESET_PULSELEN_MS);
   if(romprops.sramsize_bytes && fpga_test() == FPGA_TEST_TOKEN) {
@@ -238,6 +244,14 @@ uint8_t get_snes_reset() {
   return !BITBAND(SNES_RESET_REG->GPIO_I, SNES_RESET_BIT);
 }
 
+/* CFG.reset_to_menu == RESET_TO_MENU_DURATION: "Duration" mode. Modes 1..3 make
+   EVERY press a long reset, which short-circuits the physical detection below
+   (double press within 230ms / ~1s held). Mode 4 keeps that detection alive, so
+   a SHORT press just resets the running game while a LONG one goes back to the
+   menu exactly like mode 3 (Rom). Everything downstream already treats it as a
+   menu mode (main.c uses >= 2, snes/main.a65 uses >= 2, snes/filesel.a65 >= 3). */
+#define RESET_TO_MENU_DURATION  4
+
 uint8_t get_snes_reset_state(void) {
 
   static tick_t rising_ticks;
@@ -271,7 +285,9 @@ uint8_t get_snes_reset_state(void) {
 
   if(resbutton) { /* Yes (e.g. reset-button is pressed) */
 
-    result = cfg_is_reset_to_menu() ? SNES_RESET_LONG : SNES_RESET_SHORT;
+    uint8_t rtm = cfg_is_reset_to_menu();
+    result = (rtm && rtm != RESET_TO_MENU_DURATION) ? SNES_RESET_LONG
+                                                    : SNES_RESET_SHORT;
     reset_flag = 1;
 
     if(!resbutton_prev) { /* push, reset tick-timer */
@@ -492,6 +508,10 @@ uint8_t game_cmd_serve(uint8_t cmd) {
       msu_dac_hold();
       load_backup_state();
       msu_dac_release();
+      /* The trainer's search is NOT dropped here: this command only fires when the
+         wanted slot is not resident yet (a resident one is replayed without the MCU),
+         so the savestate handler re-baselines the snapshot itself on every real load
+         (ss_trainer_rebase). The trainer's storage is outside $F0-$F4. */
       break;
     case SNES_CMD_CHEAT_REPROGRAM:
       cheat_reprogram_from_mirror();
@@ -516,6 +536,20 @@ uint8_t game_cmd_serve(uint8_t cmd) {
          can be listed. Bounded (64 reads, no SD); the caller's snes_set_mcu_cmd(0) ACKs. */
       cheat_stage_names_window((int)(snes_get_mcu_param() & 0xffff));
       break;
+    case SNES_CMD_TRAINER_CHEAT:
+      /* in-game TRAINER tab: APPLY redeploys the freezes from the pin table; SAVE
+         turns the requested address into a real cheat through the editor's own ADD
+         and rewrites the .yml (the same frozen-SNES SD write as SNES_CMD_CHEAT_EDIT).
+         Sibling calls, not nested: the stack peaks at the deepest one. See
+         src/trainer.h. */
+      msu_dac_hold();
+      if(trainer_serve_request() && cheat_edit_serve(1)) {
+        trainer_save_done();
+        if(cheat_yaml_save_current())
+          sram_writebyte(CHEAT_EDIT_RES_SAVEFAIL, SRAM_CHEAT_EDIT_ADDR + CHEAT_EDIT_OFS_RESULT);
+      }
+      msu_dac_release();
+      break;
     case SNES_CMD_SET_SRM_SLOT:
       /* in-game SAVES tab: persist the selected SRAM slot to the sidecar (consumed on
          the NEXT game load) + refresh the status block. NEVER changes the live session
@@ -524,6 +558,16 @@ uint8_t game_cmd_serve(uint8_t cmd) {
       msu_dac_hold();
       srm_slot_save(file_lfn, (uint8_t)(snes_get_mcu_param() & 0x03));
       saveinfo_stage(file_lfn);
+      msu_dac_release();
+      break;
+    case SNES_CMD_CHEAT_EDIT:
+      /* in-game CHEATS tab: add / edit / delete a cheat (request in the CHEAT_EDIT
+         block), redeploy live, then rewrite the game's cheat .yml -- the same
+         frozen-SNES SD write SET_SRM_SLOT and SAVESTATE already do.  Sibling calls
+         (see menucmd.c) keep the stack at max(edit, save). */
+      msu_dac_hold();
+      if(cheat_edit_serve(1) && cheat_yaml_save_current())
+        sram_writebyte(CHEAT_EDIT_RES_SAVEFAIL, SRAM_CHEAT_EDIT_ADDR + CHEAT_EDIT_OFS_RESULT);
       msu_dac_release();
       break;
     case SNES_CMD_MANUAL_ZPAGE: {
